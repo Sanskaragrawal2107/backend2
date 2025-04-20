@@ -17,7 +17,7 @@ def upload_image_to_supababse(image_data: bytes, file_path: str) -> None:
     """
     try:
         # Check if bucket exists
-        bucket_name = "student_images"
+        bucket_name = "studentfaces"
         try:
             supabase.storage.get_bucket(bucket_name)
         except Exception as e:
