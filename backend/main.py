@@ -82,6 +82,7 @@ async def student_register(
     image2: UploadFile = File(...),
     image3: UploadFile = File(...),
     image4: UploadFile = File(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
 ):
     """
     Register a new student with face images for attendance tracking.
@@ -159,14 +160,16 @@ async def student_register(
             logger.error("No images were successfully uploaded")
             raise HTTPException(status_code=400, detail="No images were successfully uploaded")
 
-        # Start background task to process embeddings
-        background_tasks = BackgroundTasks()
+        # Add the background task with proper parameters
+        logger.info(f"Adding background task to process embeddings for student {student_id}")
+        logger.info(f"Number of images to process: {len(image_paths)}")
         background_tasks.add_task(process_embeddings, student_id, image_paths)
         
         return JSONResponse(
             content={
                 "message": "Student registered successfully. Face embeddings will be processed in the background.",
-                "student_id": student_id
+                "student_id": student_id,
+                "images_uploaded": len(image_paths)
             },
             status_code=201,
             background=background_tasks
@@ -195,8 +198,20 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
                 bucket_name = "studentfaces"
                 logger.info(f"Retrieving image {i} from storage: {path}")
                 
-                response = supabase.storage.from_(bucket_name).download(path)
-                data = response
+                try:
+                    # Download the image from Supabase storage
+                    response = supabase.storage.from_(bucket_name).download(path)
+                    logger.info(f"Downloaded image {i}, size: {len(response) if response else 0} bytes")
+                    
+                    if not response or len(response) == 0:
+                        logger.error(f"Downloaded empty data for image {i}")
+                        continue
+                    
+                    data = response
+                except Exception as e:
+                    logger.error(f"Error downloading image {i} from storage: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    continue
                 
                 # Process image for face embedding
                 logger.info(f"Generating face embedding for image {i}")
@@ -262,15 +277,23 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
         # Update the student record with embeddings
         try:
             logger.info(f"Updating student {student_id} with {len(embeddings_list)} embeddings")
+            logger.info(f"First embedding sample (first 5 values): {embeddings_list[0][:5]}")
+            
+            # Use direct update method
             response = supabase.table("students").update({
                 "embeddings": embeddings_list
             }).eq("student_id", student_id).execute()
             
+            if hasattr(response, 'error') and response.error:
+                logger.error(f"Database update error: {response.error}")
+                return
+                
             logger.info(f"Database update response: {response}")
             logger.info(f"Successfully updated embeddings for student {student_id}")
             
             # After successful embedding update, update the FAISS index
             load_index()
+            logger.info("FAISS index updated with new embeddings")
             
         except Exception as e:
             logger.error(f"Error updating embeddings in database: {str(e)}")
