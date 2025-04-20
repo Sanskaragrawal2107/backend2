@@ -308,13 +308,30 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
         all_features = []
         try:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            # Use more aggressive face detection parameters
+            
+            # Try multiple face detection parameters for better detection
+            # First attempt with standard parameters
             boxes = face_cascade.detectMultiScale(
                 gray, 
-                scaleFactor=1.2,   # Faster performance
-                minNeighbors=3,    # Less strict
-                minSize=(20, 20)   # Smaller face size threshold
+                scaleFactor=1.1,      # Less aggressive scaling (better detection)
+                minNeighbors=3,       # Less strict grouping
+                minSize=(20, 20)      # Smaller minimum face size
             )
+            
+            logger.info(f"Initial face detection found {len(boxes)} faces")
+            
+            # If fewer than expected faces, try more aggressive parameters
+            if len(boxes) < 2:
+                logger.info("Trying more aggressive face detection parameters")
+                boxes2 = face_cascade.detectMultiScale(
+                    gray, 
+                    scaleFactor=1.05,   # Very gradual scaling
+                    minNeighbors=2,     # Even less strict grouping
+                    minSize=(15, 15)    # Even smaller faces
+                )
+                if len(boxes2) > len(boxes):
+                    logger.info(f"Improved detection with {len(boxes2)} faces found")
+                    boxes = boxes2
             
             if len(boxes) == 0:
                 return JSONResponse(content={"message": "No faces detected"}, status_code=404)
@@ -322,16 +339,38 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
             logger.info(f"Detected {len(boxes)} faces in the image")
             
             # Set a limit on max faces to process if there are too many
-            if len(boxes) > 20:  # Arbitrary limit to prevent timeouts
-                logger.warning(f"Too many faces detected ({len(boxes)}), limiting to 20")
-                boxes = boxes[:20]
+            if len(boxes) > 30:  # Increased limit
+                logger.warning(f"Too many faces detected ({len(boxes)}), limiting to 30")
+                boxes = boxes[:30]
                 
-            # Get features for each face
+            # Get features for each face and track IDs found for debugging
+            found_ids = []
+            face_count = 0
+            
             for (x, y, w, h) in boxes:
                 face_roi = img[y:y + h, x:x + w]
+                face_count += 1
+                logger.info(f"Processing face {face_count} at position ({x},{y}) with size {w}x{h}")
+                
                 features = extract_face_features(face_roi)
                 if features and len(features) > 0:
                     all_features.append(features[0])
+                    
+                    # Try to identify this face immediately for debugging
+                    try:
+                        face_emb = np.array([features[0]]).astype('float32')
+                        _, face_I = faiss_index.search(face_emb, k=1)
+                        face_id = face_I[0][0]
+                        if face_id != -1 and face_id in students_map:
+                            student_id = students_map[face_id]
+                            found_ids.append(student_id)
+                            logger.info(f"Face {face_count} matched with student_id: {student_id}")
+                        else:
+                            logger.info(f"Face {face_count} did not match any known student")
+                    except Exception as e:
+                        logger.error(f"Error during face identification: {e}")
+                else:
+                    logger.info(f"No features extracted for face {face_count}")
                     
                 # Break if processing is taking too long
                 if (datetime.now() - start_time).total_seconds() > 25:  # 25 sec limit (30 sec timeout common)
@@ -344,6 +383,9 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
                 
             if not all_features:
                 return JSONResponse(content={"message": "No valid face features extracted"}, status_code=404)
+               
+            logger.info(f"Extracted features for {len(all_features)} out of {len(boxes)} detected faces")
+            logger.info(f"Preliminary student IDs found: {found_ids}")
                 
         except Exception as e:
             logger.error(f"Face detection error: {str(e)}")
@@ -360,7 +402,19 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
                 if faiss_index.ntotal == 0:
                     return JSONResponse(content={"message": "No student data available for comparison"}, status_code=404)
                     
-            _, I = faiss_index.search(emb_arr, k=1)
+            logger.info(f"Searching FAISS index with {faiss_index.ntotal} total vectors")
+            
+            # Use lower distance threshold for better matching
+            distances, I = faiss_index.search(emb_arr, k=1)
+            
+            # Log all the matches
+            for i, (dist, idx) in enumerate(zip(distances, I)):
+                face_id = idx[0]
+                distance = dist[0]
+                if face_id != -1 and face_id in students_map:
+                    logger.info(f"Face {i+1} matched student_id {students_map[face_id]} with distance {distance}")
+                else:
+                    logger.info(f"Face {i+1} had no match, distance: {distance}")
             
             # Get unique student IDs
             unique_ids = list({students_map[i] for i in I.flatten() if i != -1 and i in students_map})
@@ -368,7 +422,7 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
             if not unique_ids:
                 return JSONResponse(content={"message": "No students matched in the database"}, status_code=404)
                 
-            logger.info(f"Found {len(unique_ids)} unique students")
+            logger.info(f"Found {len(unique_ids)} unique students: {unique_ids}")
                 
         except Exception as e:
             logger.error(f"FAISS search error: {str(e)}")
