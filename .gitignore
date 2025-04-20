@@ -1,0 +1,39 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv311/
+.env
+.venv/
+venv/
+env/
+
+# Editor/IDE files
+.vscode/
+.idea/
+*.iml
+
+# Distribution/build files
+build/
+dist/
+*.egg-info/
+
+# Logs and databases
+*.log
+*.sqlite3
+
+# Supabase local files and caches
+backend/store/
+backend/temp/
+
+# Streamlit cache
+.streamlit/cache
+
+# pytest cache
+.pytest_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
