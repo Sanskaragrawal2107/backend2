@@ -6,24 +6,21 @@ from backend.utils.supabase_upload import upload_image_to_supababse
 import os, cv2, pickle
 import numpy as np
 import faiss
-from deepface import DeepFace
 from datetime import date, datetime
-from typing import List
 import logging
 import uvicorn
 import traceback
-import asyncio
-from functools import partial
+import gc
+from typing import List
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-embedding_dim = 128  # Changed from 512 to 128 for lightweight features
+embedding_dim = 128
 faiss_index = faiss.IndexIDMap(faiss.IndexFlatL2(embedding_dim))
 students_map = {}
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-# Function to extract features using simple OpenCV methods - no face module required
 def extract_face_features(image):
     """Extract face features using OpenCV histogram and pixel-based features"""
     try:
@@ -35,10 +32,7 @@ def extract_face_features(image):
             
         # Detect faces
         faces = face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(30, 30)
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
         )
         
         if len(faces) == 0:
@@ -50,30 +44,23 @@ def extract_face_features(image):
         # Process each detected face
         for (x, y, w, h) in faces:
             face_roi = gray[y:y+h, x:x+w]
-            
-            # Resize to a standard size
             face_roi = cv2.resize(face_roi, (100, 100))
-            
-            # Normalize the image
             face_roi = cv2.equalizeHist(face_roi)
             
-            # Simple feature extraction - pixel values + histogram
-            # This is much more memory efficient than deep learning features
+            # Extract features - histogram + key pixels
             hist = cv2.calcHist([face_roi], [0], None, [64], [0, 256])
-            hist = hist.flatten() / np.sum(hist)  # Normalize
+            hist = hist.flatten() / np.sum(hist)
             
-            # Downsample the face image to get key pixels
             small_face = cv2.resize(face_roi, (8, 8))
-            key_pixels = small_face.flatten() / 255.0  # Normalize
+            key_pixels = small_face.flatten() / 255.0
             
-            # Combine histogram and key pixels as features
+            # Combine and ensure correct dimension
             feature_vector = np.concatenate([hist, key_pixels])
             
-            # Resize to match embedding_dim
+            # Ensure exact embedding_dim length
             if len(feature_vector) > embedding_dim:
                 feature_vector = feature_vector[:embedding_dim]
             elif len(feature_vector) < embedding_dim:
-                # Pad with zeros if needed
                 feature_vector = np.pad(feature_vector, (0, embedding_dim - len(feature_vector)))
                 
             features.append(feature_vector)
@@ -81,7 +68,6 @@ def extract_face_features(image):
         return features
     except Exception as e:
         logger.error(f"Error extracting features: {str(e)}")
-        logger.error(traceback.format_exc())
         return []
 
 app = FastAPI(
@@ -89,6 +75,7 @@ app = FastAPI(
     description="API for student attendance tracking using facial recognition",
     version="1.0.0"
 )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -100,12 +87,10 @@ app.add_middleware(
 @app.get("/")
 async def root():
     try:
-        # Test Supabase connection
         supabase.table("students").select("count").execute()
         return {"status": "healthy", "message": "Attendance System API is running"}
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
-        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
 
 def load_index():
@@ -113,6 +98,7 @@ def load_index():
     store_dir = "store"
     idx_file = os.path.join(store_dir, "index.faiss")
     map_file = os.path.join(store_dir, "map.pkl")
+    
     if os.path.exists(idx_file) and os.path.exists(map_file):
         faiss_index = faiss.read_index(idx_file)
         students_map = pickle.load(open(map_file, "rb"))
@@ -127,6 +113,7 @@ def load_index():
             students_map[internal_id] = sid
             ids = np.full((vecs.shape[0],), internal_id, dtype="int64")
             faiss_index.add_with_ids(vecs, ids)
+        
         os.makedirs(store_dir, exist_ok=True)
         faiss.write_index(faiss_index, idx_file)
         pickle.dump(students_map, open(map_file, "wb"))
@@ -144,85 +131,52 @@ async def student_register(
     image4: UploadFile = File(...),
     background_tasks: BackgroundTasks = BackgroundTasks(),
 ):
-    """
-    Register a new student with face images for attendance tracking.
-    This endpoint now works in two phases:
-    1. Upload images and register student basic info
-    2. Process embeddings in a background task
-    """
     try:
-        logger.info(f"Starting student registration process for student_id: {student_id}")
-        logger.info(f"Student details - Name: {name}, Class: {class_id}")
-        
+        logger.info(f"Registering student: {student_id}, {name}, {class_id}")
         folder_path = f"{class_id}__{student_id}__{name}"
         
-        # Validate student_id format
+        # Validate input
         if not student_id.strip():
-            logger.error("Empty student ID provided")
             raise HTTPException(status_code=400, detail="Student ID cannot be empty")
             
-        # Check if student already exists
-        logger.info(f"Checking if student {student_id} already exists")
+        # Check if student exists
         existing = supabase.table("students").select("student_id").eq("student_id", student_id).execute()
         if existing.data:
-            logger.error(f"Student with ID {student_id} already exists")
             raise HTTPException(status_code=400, detail=f"Student with ID {student_id} already exists")
         
-        # First, register the student without embeddings to avoid timeout
-        try:
-            logger.info("Registering student basic information first")
-            student_data = {
-                "student_id": student_id,
-                "name": name,
-                "class_id": class_id,
-                "image_folder_path": folder_path,
-                "embeddings": []  # Empty array initially
-            }
-            
-            response = supabase.table("students").insert(student_data).execute()
-            logger.info(f"Initial student registration response: {response}")
-            
-            if hasattr(response, 'error') and response.error:
-                logger.error(f"Student registration error: {response.error}")
-                raise HTTPException(status_code=500, detail=f"Database error: {response.error}")
-                
-            logger.info("Successfully registered student basic information")
-        except Exception as e:
-            logger.error(f"Error registering student: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        # Register student basic info
+        student_data = {
+            "student_id": student_id,
+            "name": name,
+            "class_id": class_id,
+            "image_folder_path": folder_path,
+            "embeddings": []
+        }
+        
+        response = supabase.table("students").insert(student_data).execute()
+        if hasattr(response, 'error') and response.error:
+            raise HTTPException(status_code=500, detail=f"Database error: {response.error}")
 
-        # Next, upload and process images one by one
+        # Upload images
         image_paths = []
         for i, img in enumerate([image1, image2, image3, image4], 1):
             try:
-                logger.info(f"Processing image {i} for student {student_id}")
-                # Read image data
                 data = await img.read()
                 if not data:
-                    logger.error(f"Image {i} is empty")
-                    raise HTTPException(status_code=400, detail=f"Image {i} is empty")
+                    continue
                     
-                # Upload image to Supabase
                 image_path = f"{folder_path}/face_{i}.jpg"
-                logger.info(f"Uploading image {i} to Supabase at path: {image_path}")
                 upload_image_to_supababse(data, image_path)
                 image_paths.append(image_path)
-                logger.info(f"Successfully uploaded image {i}")
                 
             except Exception as e:
-                logger.error(f"Error processing image {i}: {str(e)}")
-                logger.error(traceback.format_exc())
-                # Continue with other images instead of failing completely
+                logger.error(f"Error uploading image {i}: {str(e)}")
                 continue
 
         if not image_paths:
-            logger.error("No images were successfully uploaded")
             raise HTTPException(status_code=400, detail="No images were successfully uploaded")
 
-        # Add the background task with proper parameters
-        logger.info(f"Adding background task to process embeddings for student {student_id}")
-        logger.info(f"Number of images to process: {len(image_paths)}")
+        # Process embeddings in background
         background_tasks.add_task(process_embeddings, student_id, image_paths)
         
         return JSONResponse(
@@ -234,235 +188,224 @@ async def student_register(
             status_code=201,
             background=background_tasks
         )
+        
     except HTTPException as he:
-        logger.error(f"HTTP Exception in registration: {str(he)}")
         raise he
     except Exception as e:
         logger.error(f"Registration failed: {str(e)}")
-        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
 
 async def process_embeddings(student_id: str, image_paths: List[str]):
-    """Background task to process face embeddings and update the student record."""
     try:
-        logger.info(f"Starting background embedding processing for student {student_id}")
-        logger.info(f"Processing {len(image_paths)} images")
-        
+        logger.info(f"Processing embeddings for student {student_id}: {len(image_paths)} images")
         vectors = []
         
-        # Get the images from storage and process them
+        # Process each image
         for i, path in enumerate(image_paths, 1):
             try:
-                logger.info(f"Processing image {i} of {len(image_paths)} for student {student_id}")
-                
                 # Get image from Supabase storage
                 bucket_name = "studentfaces"
-                logger.info(f"Retrieving image {i} from storage: {path}")
+                response = supabase.storage.from_(bucket_name).download(path)
                 
-                try:
-                    # Download the image from Supabase storage
-                    response = supabase.storage.from_(bucket_name).download(path)
-                    logger.info(f"Downloaded image {i}, size: {len(response) if response else 0} bytes")
-                    
-                    if not response or len(response) == 0:
-                        logger.error(f"Downloaded empty data for image {i}")
-                        continue
-                    
-                    data = response
-                except Exception as e:
-                    logger.error(f"Error downloading image {i} from storage: {str(e)}")
-                    logger.error(traceback.format_exc())
+                if not response or len(response) == 0:
                     continue
                 
-                # Process image for face embedding with aggressive memory management
-                logger.info(f"Generating face embedding for image {i}")
-                nparr = np.frombuffer(data, dtype=np.uint8)
+                # Convert to image array
+                nparr = np.frombuffer(response, dtype=np.uint8)
                 img_arr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                
-                # Clear data from memory immediately
-                del data
-                del nparr
-                import gc
+                del response, nparr
                 gc.collect()
                 
                 if img_arr is None:
-                    logger.error(f"Failed to decode image {i}")
                     continue
                 
-                # Optimize image size to reduce memory usage
+                # Resize large images to save memory
                 max_size = 300
                 h, w = img_arr.shape[:2]
                 if h > max_size or w > max_size:
                     scale = max_size / max(h, w)
-                    new_size = (int(w * scale), int(h * scale))
-                    logger.info(f"Resizing image from {w}x{h} to {new_size[0]}x{new_size[1]}")
-                    img_arr = cv2.resize(img_arr, new_size, interpolation=cv2.INTER_AREA)
+                    img_arr = cv2.resize(img_arr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
                 
-                # Process one image at a time with careful memory management
-                try:
-                    # Use our lightweight feature extraction instead of DeepFace
-                    logger.info("Using lightweight feature extraction")
-                    features = extract_face_features(img_arr)
-                    
-                    if features and len(features) > 0:
-                        # Use the first face's features
-                        vectors.append(features[0])
-                        logger.info(f"Successfully extracted features for image {i}")
-                    else:
-                        logger.error(f"No features extracted from image {i}")
-                        
-                except Exception as e:
-                    logger.error(f"Failed to extract features: {str(e)}")
-                    logger.error(traceback.format_exc())
-                    continue
+                # Extract features
+                features = extract_face_features(img_arr)
+                if features and len(features) > 0:
+                    feature_vec = features[0]
+                    # Log dimensions to debug the 520 vs 128 issue
+                    logger.info(f"Feature vector dimensions: {len(feature_vec)}")
+                    vectors.append(feature_vec)
                 
-                # Clear memory after each image
-                del img_arr
-                import gc
+                # Clear memory
+                del img_arr, features
                 gc.collect()
                 
             except Exception as e:
                 logger.error(f"Error processing image {i}: {str(e)}")
-                logger.error(traceback.format_exc())
                 continue
 
         if not vectors:
-            logger.error("No valid face embeddings generated from images")
+            logger.error("No valid face embeddings generated")
             return
         
-        # Convert embeddings to proper format for Supabase
-        try:
-            logger.info(f"Converting {len(vectors)} embeddings to list format")
+        # Convert embeddings for storage
+        embeddings_list = []
+        for embedding in vectors:
+            # Ensure exactly embedding_dim dimensions
+            emb_list = [float(round(val, 4)) for val in embedding.tolist()[:embedding_dim]]
+            embeddings_list.append(emb_list)
             
-            # Process each embedding separately to manage memory
-            embeddings_list = []
-            for j, embedding in enumerate(vectors):
-                # Convert with aggressive rounding to save space
-                emb_list = [float(round(val, 4)) for val in embedding.tolist()]
-                embeddings_list.append(emb_list)
-                
-                # Clear intermediate data
-                del embedding
-                
-                if (j+1) % 2 == 0:
-                    gc.collect()  # Run GC every 2 embeddings
-                    
-            logger.info(f"Successfully converted {len(embeddings_list)} embeddings to list format")
+        # Update database with embeddings
+        if embeddings_list:
+            response = supabase.table("students").update({
+                "embeddings": embeddings_list
+            }).eq("student_id", student_id).execute()
             
-            # Clear vectors to free memory
-            del vectors
-            gc.collect()
-            
-        except Exception as e:
-            logger.error(f"Error converting embeddings to list: {str(e)}")
-            logger.error(traceback.format_exc())
-            
-        # Update the student record with embeddings
-        try:
-            logger.info(f"Updating student {student_id} with {len(embeddings_list)} embeddings")
-            if embeddings_list and len(embeddings_list) > 0:
-                logger.info(f"First embedding length: {len(embeddings_list[0])}")
-                
-                # Update database
-                response = supabase.table("students").update({
-                    "embeddings": embeddings_list
-                }).eq("student_id", student_id).execute()
-                
-                if hasattr(response, 'error') and response.error:
-                    logger.error(f"Database update error: {response.error}")
-                    return
-                    
-                logger.info(f"Database update response status: {response.status_code if hasattr(response, 'status_code') else 'unknown'}")
-                logger.info(f"Successfully updated embeddings for student {student_id}")
-                
-                # After successful embedding update, update the FAISS index
+            if not hasattr(response, 'error') or not response.error:
+                logger.info(f"Updated embeddings for student {student_id}")
+                # Update FAISS index
                 try:
                     load_index()
-                    logger.info("FAISS index updated with new embeddings")
                 except Exception as e:
                     logger.error(f"Error updating FAISS index: {str(e)}")
-            else:
-                logger.error("No embeddings to update")
-            
-        except Exception as e:
-            logger.error(f"Error updating embeddings in database: {str(e)}")
-            logger.error(traceback.format_exc())
             
     except Exception as e:
-        logger.error(f"Background embedding processing failed: {str(e)}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Embedding processing failed: {str(e)}")
 
 @app.post("/mark-attendance")
-async def mark_attendance(
-    teacher_image: UploadFile = File(...)
-):
-    """
-    Takes a teacher image, compares it with stored embeddings in FAISS, and returns detected students.
-    """
-    # Read image bytes and decode with OpenCV (no temp file)
-    data = await teacher_image.read()
-    nparr = np.frombuffer(data, dtype=np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    
-    # Use our lightweight feature extraction
-    logger.info("Extracting features from classroom image")
-    all_features = []
-    
-    # First try with face detection
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    boxes = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
-    
-    if len(boxes) == 0:
-        return JSONResponse(content={"message": "No students detected. Try again with a clearer photo."}, status_code=404)
-    
-    # Extract features for each detected face
-    for (x, y, w, h) in boxes:
-        face_roi = img[y:y + h, x:x + w]
-        features = extract_face_features(face_roi)
-        if features and len(features) > 0:
-            all_features.append(features[0])
-    
-    if not all_features:
-        return JSONResponse(content={"message": "No valid face features could be extracted. Try again with a clearer photo."}, status_code=404)
+async def mark_attendance(teacher_image: UploadFile = File(...)):
+    try:
+        # Process image with timeout control
+        logger.info("Starting attendance marking process")
+        
+        # Get image data
+        start_time = datetime.now()
+        data = await teacher_image.read()
+        if not data or len(data) < 1000:  # Basic size check
+            return JSONResponse(content={"message": "Invalid image data"}, status_code=400)
+            
+        # Convert to numpy array with memory management
+        try:
+            nparr = np.frombuffer(data, dtype=np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            # Free memory immediately
+            del data
+            gc.collect()
+            
+            if img is None or img.size == 0:
+                return JSONResponse(content={"message": "Could not decode image"}, status_code=400)
+                
+            # Resize if image is too large (improves processing speed and reduces memory)
+            max_size = 800
+            h, w = img.shape[:2]
+            if h > max_size or w > max_size:
+                scale = max_size / max(h, w)
+                img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+                logger.info(f"Resized image to {img.shape[1]}x{img.shape[0]}")
+        except Exception as e:
+            logger.error(f"Image decoding error: {str(e)}")
+            return JSONResponse(content={"message": "Error processing image"}, status_code=400)
+            
+        # Extract features from classroom image
+        all_features = []
+        try:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            # Use more aggressive face detection parameters
+            boxes = face_cascade.detectMultiScale(
+                gray, 
+                scaleFactor=1.2,   # Faster performance
+                minNeighbors=3,    # Less strict
+                minSize=(20, 20)   # Smaller face size threshold
+            )
+            
+            if len(boxes) == 0:
+                return JSONResponse(content={"message": "No faces detected"}, status_code=404)
+            
+            logger.info(f"Detected {len(boxes)} faces in the image")
+            
+            # Set a limit on max faces to process if there are too many
+            if len(boxes) > 20:  # Arbitrary limit to prevent timeouts
+                logger.warning(f"Too many faces detected ({len(boxes)}), limiting to 20")
+                boxes = boxes[:20]
+                
+            # Get features for each face
+            for (x, y, w, h) in boxes:
+                face_roi = img[y:y + h, x:x + w]
+                features = extract_face_features(face_roi)
+                if features and len(features) > 0:
+                    all_features.append(features[0])
+                    
+                # Break if processing is taking too long
+                if (datetime.now() - start_time).total_seconds() > 25:  # 25 sec limit (30 sec timeout common)
+                    logger.warning("Face detection taking too long, stopping early")
+                    break
+                    
+            # Clean up memory  
+            del img, gray
+            gc.collect()
+                
+            if not all_features:
+                return JSONResponse(content={"message": "No valid face features extracted"}, status_code=404)
+                
+        except Exception as e:
+            logger.error(f"Face detection error: {str(e)}")
+            return JSONResponse(content={"message": "Error detecting faces"}, status_code=500)
+            
+        # Search in FAISS index
+        try:
+            emb_arr = np.vstack(all_features).astype('float32')
+            
+            # Sanity check on FAISS index
+            if faiss_index.ntotal == 0:
+                logger.error("FAISS index is empty, attempting to reload")
+                load_index()
+                if faiss_index.ntotal == 0:
+                    return JSONResponse(content={"message": "No student data available for comparison"}, status_code=404)
+                    
+            _, I = faiss_index.search(emb_arr, k=1)
+            
+            # Get unique student IDs
+            unique_ids = list({students_map[i] for i in I.flatten() if i != -1 and i in students_map})
+            
+            if not unique_ids:
+                return JSONResponse(content={"message": "No students matched in the database"}, status_code=404)
+                
+            logger.info(f"Found {len(unique_ids)} unique students")
+                
+        except Exception as e:
+            logger.error(f"FAISS search error: {str(e)}")
+            return JSONResponse(content={"message": "Error matching faces to database"}, status_code=500)
 
-    # Stack features for FAISS search
-    emb_arr = np.vstack(all_features).astype('float32')
-    
-    # Search in FAISS index
-    _, I = faiss_index.search(emb_arr, k=1)
-    found = I.flatten()
-    
-    # Get unique student IDs
-    unique_ids = list({students_map[i] for i in found if i != -1 and i in students_map})
-
-    # Get student details from database
-    detected_students = []
-    if unique_ids:
-        detected_students = supabase.table("students").select('*').in_("student_id", unique_ids).execute().data
-
-    return JSONResponse(content={"detected_students": detected_students}, status_code=200)
+        # Get student details with timeout handling
+        try:
+            detected_students = []
+            if unique_ids:
+                # Use a more efficient select that doesn't fetch embeddings
+                response = supabase.table("students").select('student_id,name,class_id').in_("student_id", unique_ids).execute()
+                detected_students = response.data
+                
+            return JSONResponse(content={"detected_students": detected_students}, status_code=200)
+            
+        except Exception as e:
+            logger.error(f"Database query error: {str(e)}")
+            return JSONResponse(content={"message": "Error retrieving student details"}, status_code=500)
+            
+    except Exception as e:
+        # Catch-all exception handler
+        logger.error(f"Unexpected error in mark_attendance: {str(e)}")
+        return JSONResponse(content={"message": "Server error processing attendance"}, status_code=500)
 
 @app.post("/save-attendance")
-async def save_attendance(
-    student_ids: List[str] = Body(...),
-):
-    """Save daily attendance records in Supabase."""
-    logging.info(f"Received attendance to save: {student_ids}")
+async def save_attendance(student_ids: List[str] = Body(...)):
     today_str = date.today().isoformat()
     saved = []
+    
     for sid in student_ids:
-        # Check if already recorded for today
-        existing = supabase.table("attendance") \
-            .select("id") \
-            .eq("student_id", sid) \
-            .eq("date", today_str) \
-            .execute().data
+        # Check if already recorded today
+        existing = supabase.table("attendance").select("id").eq("student_id", sid).eq("date", today_str).execute().data
         if not existing:
             # Insert new record
-            supabase.table("attendance") \
-                .insert({"student_id": sid, "date": today_str, "present": True}) \
-                .execute()
+            supabase.table("attendance").insert({"student_id": sid, "date": today_str, "present": True}).execute()
             saved.append(sid)
+            
     return JSONResponse(
         content={"message": "Attendance saved", "saved": saved},
         status_code=201
@@ -470,52 +413,42 @@ async def save_attendance(
 
 @app.get("/check-embeddings/{student_id}")
 async def check_embeddings(student_id: str):
-    """
-    Check if embeddings have been processed and stored for a specific student.
-    Returns status information based on whether embeddings exist.
-    """
     try:
-        logger.info(f"Checking embedding status for student: {student_id}")
-        
-        # Query the database for the student
+        # Get student data
         response = supabase.table("students").select("*").eq("student_id", student_id).execute()
         
         if not response.data:
-            logger.error(f"Student {student_id} not found")
             raise HTTPException(status_code=404, detail=f"Student with ID {student_id} not found")
         
         student_data = response.data[0]
         embeddings = student_data.get("embeddings", [])
         
-        # If embeddings exist and are not empty
+        # Check if embeddings exist
         if embeddings and len(embeddings) > 0:
-            logger.info(f"Found {len(embeddings)} embeddings for student {student_id}")
             return {
                 "student_id": student_id,
                 "name": student_data.get("name", ""),
                 "embedding_status": "complete",
                 "embeddings_count": len(embeddings),
-                "embedding_dimensions": len(embeddings[0]) if len(embeddings) > 0 else 0,
+                "embedding_dimensions": len(embeddings[0]) if embeddings else 0,
                 "processing_complete": True,
-                "message": "Face embeddings have been successfully processed and stored"
+                "message": "Face embeddings successfully processed"
             }
         
-        # If no embeddings yet
-        logger.info(f"No embeddings found for student {student_id}")
+        # No embeddings yet
         return {
             "student_id": student_id,
             "name": student_data.get("name", ""),
             "embedding_status": "pending",
             "embeddings_count": 0,
             "processing_complete": False,
-            "message": "Embeddings are still being processed or have not been generated yet"
+            "message": "Embeddings are being processed"
         }
         
     except HTTPException as he:
         raise he
     except Exception as e:
         logger.error(f"Error checking embeddings: {str(e)}")
-        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error checking embeddings: {str(e)}")
 
 if __name__ == "__main__":
