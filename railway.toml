@@ -1,9 +1,9 @@
 [build]
 builder = "NIXPACKS"
-buildCommand = "pip install -r requirements.txt"
+buildCommand = "pip install -r requirements.txt && chmod +x start.sh"
 
 [deploy]
-startCommand = "python -m uvicorn main:app --host 0.0.0.0 --port $PORT"
+startCommand = "./start.sh"
 healthcheckPath = "/"
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"
@@ -14,6 +14,6 @@ port = 8000
 path = "/"
 
 [http]
-requestTimeout = 300
-readHeaderTimeout = 60
-idleTimeout = 300 
+requestTimeout = 300    # 5 minutes
+readHeaderTimeout = 60  # 1 minute
+idleTimeout = 300       # 5 minutes 
