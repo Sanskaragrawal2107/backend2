@@ -16,6 +16,7 @@ deepface==0.0.93
 deprecation==2.1.0
 faiss-cpu==1.10.0
 fastapi==0.95.2
+starlette==0.27.0
 pydantic==1.10.8
 filelock==3.18.0
 fire==0.7.0
@@ -81,7 +82,6 @@ rich==14.0.0
 six==1.17.0
 sniffio==1.3.1
 soupsieve==2.6
-starlette==0.46.2
 storage3==0.11.3
 StrEnum==0.4.15
 supabase==2.15.0
