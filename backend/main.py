@@ -191,6 +191,10 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
         
         vectors = []
         
+        # Use a smaller model that requires less memory
+        model_name = "VGG-Face"  # Smaller than Facenet512
+        logger.info(f"Using face recognition model: {model_name}")
+        
         # Get the images from storage and process them
         for i, path in enumerate(image_paths, 1):
             try:
@@ -213,16 +217,23 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
                     logger.error(traceback.format_exc())
                     continue
                 
-                # Process image for face embedding
+                # Process image for face embedding with aggressive memory management
                 logger.info(f"Generating face embedding for image {i}")
                 nparr = np.frombuffer(data, dtype=np.uint8)
                 img_arr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                # Clear data from memory immediately
+                del data
+                del nparr
+                import gc
+                gc.collect()
+                
                 if img_arr is None:
                     logger.error(f"Failed to decode image {i}")
                     continue
                 
-                # Optimize image size to reduce memory usage
-                max_size = 800
+                # Optimize image size to reduce memory usage - use smaller size
+                max_size = 300  # Much smaller than before (800)
                 h, w = img_arr.shape[:2]
                 if h > max_size or w > max_size:
                     scale = max_size / max(h, w)
@@ -230,26 +241,21 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
                     logger.info(f"Resizing image from {w}x{h} to {new_size[0]}x{new_size[1]}")
                     img_arr = cv2.resize(img_arr, new_size, interpolation=cv2.INTER_AREA)
                 
-                # Try with face detection first
+                # Process one image at a time with careful memory management
                 try:
-                    logger.info("Attempting face embedding with detection")
-                    rep = DeepFace.represent(img_arr, model_name="Facenet512", enforce_detection=True)
+                    # Skip face detection altogether to save memory
+                    logger.info("Generating face embedding without detection")
+                    rep = DeepFace.represent(img_arr, model_name=model_name, enforce_detection=False)
                     vectors.append(rep[0]["embedding"])
-                    logger.info(f"Successfully generated embedding for image {i} with face detection")
+                    logger.info(f"Successfully generated embedding for image {i}")
                 except Exception as e:
-                    logger.warning(f"Face detection failed, trying without detection: {str(e)}")
-                    try:
-                        # If detection fails, try without detection
-                        rep = DeepFace.represent(img_arr, model_name="Facenet512", enforce_detection=False)
-                        vectors.append(rep[0]["embedding"])
-                        logger.info(f"Successfully generated embedding for image {i} without face detection")
-                    except Exception as e2:
-                        logger.error(f"Failed to generate embedding without detection: {str(e2)}")
-                        continue
+                    logger.error(f"Failed to generate embedding: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    continue
                 
-                # Clear memory
+                # Clear memory after each image
                 del img_arr
-                del nparr
+                del rep
                 import gc
                 gc.collect()
                 
@@ -264,11 +270,27 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
         
         # Convert embeddings to proper format for Supabase
         try:
+            logger.info(f"Converting {len(vectors)} embeddings to list format")
+            
+            # Process each embedding separately to manage memory
             embeddings_list = []
-            for embedding in vectors:
-                emb_list = [float(round(val, 6)) for val in embedding.tolist()]
+            for j, embedding in enumerate(vectors):
+                # Convert with aggressive rounding to save space
+                emb_list = [float(round(val, 4)) for val in embedding.tolist()]
                 embeddings_list.append(emb_list)
+                
+                # Clear intermediate data
+                del embedding
+                
+                if (j+1) % 2 == 0:
+                    gc.collect()  # Run GC every 2 embeddings
+                    
             logger.info(f"Successfully converted {len(embeddings_list)} embeddings to list format")
+            
+            # Clear vectors to free memory
+            del vectors
+            gc.collect()
+            
         except Exception as e:
             logger.error(f"Error converting embeddings to list: {str(e)}")
             logger.error(traceback.format_exc())
@@ -277,23 +299,29 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
         # Update the student record with embeddings
         try:
             logger.info(f"Updating student {student_id} with {len(embeddings_list)} embeddings")
-            logger.info(f"First embedding sample (first 5 values): {embeddings_list[0][:5]}")
-            
-            # Use direct update method
-            response = supabase.table("students").update({
-                "embeddings": embeddings_list
-            }).eq("student_id", student_id).execute()
-            
-            if hasattr(response, 'error') and response.error:
-                logger.error(f"Database update error: {response.error}")
-                return
+            if embeddings_list and len(embeddings_list) > 0:
+                logger.info(f"First embedding length: {len(embeddings_list[0])}")
                 
-            logger.info(f"Database update response: {response}")
-            logger.info(f"Successfully updated embeddings for student {student_id}")
-            
-            # After successful embedding update, update the FAISS index
-            load_index()
-            logger.info("FAISS index updated with new embeddings")
+                # Update database
+                response = supabase.table("students").update({
+                    "embeddings": embeddings_list
+                }).eq("student_id", student_id).execute()
+                
+                if hasattr(response, 'error') and response.error:
+                    logger.error(f"Database update error: {response.error}")
+                    return
+                    
+                logger.info(f"Database update response status: {response.status_code if hasattr(response, 'status_code') else 'unknown'}")
+                logger.info(f"Successfully updated embeddings for student {student_id}")
+                
+                # After successful embedding update, update the FAISS index
+                try:
+                    load_index()
+                    logger.info("FAISS index updated with new embeddings")
+                except Exception as e:
+                    logger.error(f"Error updating FAISS index: {str(e)}")
+            else:
+                logger.error("No embeddings to update")
             
         except Exception as e:
             logger.error(f"Error updating embeddings in database: {str(e)}")
