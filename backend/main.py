@@ -85,20 +85,40 @@ async def student_register(
         folder_path = f"{class_id}__{student_id}__{name}"
         vectors = []
         
+        # Validate student_id format
+        if not student_id.strip():
+            raise HTTPException(status_code=400, detail="Student ID cannot be empty")
+            
+        # Check if student already exists
+        existing = supabase.table("students").select("student_id").eq("student_id", student_id).execute()
+        if existing.data:
+            raise HTTPException(status_code=400, detail=f"Student with ID {student_id} already exists")
+        
         for i, img in enumerate([image1, image2, image3, image4], 1):
             try:
                 data = await img.read()
+                if not data:
+                    raise HTTPException(status_code=400, detail=f"Image {i} is empty")
+                    
                 # upload raw bytes to Supabase storage
                 upload_image_to_supababse(data, f"{folder_path}/face_{i}.jpg")
                 # decode image for embedding
                 nparr = np.frombuffer(data, dtype=np.uint8)
                 img_arr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if img_arr is None:
+                    raise HTTPException(status_code=400, detail=f"Failed to decode image {i}")
+                    
                 rep = DeepFace.represent(img_arr, model_name="Facenet512", enforce_detection=False)
                 vectors.append(rep[0]["embedding"])
+            except HTTPException as he:
+                raise he
             except Exception as e:
                 logger.error(f"Error processing image {i}: {str(e)}")
                 logger.error(traceback.format_exc())
                 raise HTTPException(status_code=400, detail=f"Error processing image {i}: {str(e)}")
+
+        if not vectors:
+            raise HTTPException(status_code=400, detail="No valid face embeddings generated from images")
 
         try:
             supabase.table("students").insert({
@@ -114,10 +134,12 @@ async def student_register(
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
         return JSONResponse(content={"message": "registration successful"}, status_code=201)
+    except HTTPException as he:
+        raise he
     except Exception as e:
         logger.error(f"Registration failed: {str(e)}")
         logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
 
 @app.post("/mark-attendance")
 async def mark_attendance(
