@@ -12,6 +12,8 @@ from typing import List
 import logging
 import uvicorn
 import traceback
+import asyncio
+from functools import partial
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -80,6 +82,17 @@ async def student_register(
     image3: UploadFile = File(...),
     image4: UploadFile = File(...),
 ):
+    """
+    Register a new student with face images for attendance tracking.
+    
+    This endpoint:
+    1. Validates student information
+    2. Processes and uploads face images
+    3. Generates face embeddings
+    4. Saves student data to the database
+    
+    The face embedding process is resource-intensive and may take some time.
+    """
     try:
         logger.info(f"Starting student registration process for student_id: {student_id}")
         logger.info(f"Student details - Name: {name}, Class: {class_id}")
@@ -99,6 +112,7 @@ async def student_register(
             logger.error(f"Student with ID {student_id} already exists")
             raise HTTPException(status_code=400, detail=f"Student with ID {student_id} already exists")
         
+        # Process one image at a time to reduce memory usage
         for i, img in enumerate([image1, image2, image3, image4], 1):
             try:
                 logger.info(f"Processing image {i} for student {student_id}")
@@ -119,11 +133,40 @@ async def student_register(
                 if img_arr is None:
                     logger.error(f"Failed to decode image {i}")
                     raise HTTPException(status_code=400, detail=f"Failed to decode image {i}")
-                    
-                # Generate face embedding
-                rep = DeepFace.represent(img_arr, model_name="Facenet512", enforce_detection=False)
-                vectors.append(rep[0]["embedding"])
-                logger.info(f"Successfully generated embedding for image {i}")
+                
+                # Optimize image size to reduce memory usage
+                max_size = 800
+                h, w = img_arr.shape[:2]
+                if h > max_size or w > max_size:
+                    scale = max_size / max(h, w)
+                    new_size = (int(w * scale), int(h * scale))
+                    logger.info(f"Resizing image from {w}x{h} to {new_size[0]}x{new_size[1]}")
+                    img_arr = cv2.resize(img_arr, new_size, interpolation=cv2.INTER_AREA)
+                
+                # Process face with error handling
+                try:
+                    # Try with face detection first
+                    logger.info("Attempting face embedding with detection")
+                    rep = DeepFace.represent(img_arr, model_name="Facenet512", enforce_detection=True)
+                    vectors.append(rep[0]["embedding"])
+                    logger.info(f"Successfully generated embedding for image {i} with face detection")
+                except Exception as e:
+                    logger.warning(f"Face detection failed, trying without detection: {str(e)}")
+                    try:
+                        # If detection fails, try without detection
+                        rep = DeepFace.represent(img_arr, model_name="Facenet512", enforce_detection=False)
+                        vectors.append(rep[0]["embedding"])
+                        logger.info(f"Successfully generated embedding for image {i} without face detection")
+                    except Exception as e2:
+                        logger.error(f"Failed to generate embedding without detection: {str(e2)}")
+                        raise Exception(f"Face embedding generation failed: {str(e2)}")
+                
+                # Clear memory
+                del img_arr
+                del nparr
+                # Force garbage collection to free memory
+                import gc
+                gc.collect()
                 
             except HTTPException as he:
                 logger.error(f"HTTP Exception in image {i} processing: {str(he)}")
@@ -142,8 +185,18 @@ async def student_register(
             logger.info(f"Student data: student_id={student_id}, name={name}, class_id={class_id}")
             logger.info(f"Number of embeddings: {len(vectors)}")
             
-            # Convert numpy arrays to lists for Supabase
-            embeddings_list = [embedding.tolist() for embedding in vectors]
+            # Convert numpy arrays to lists for Supabase and ensure it's JSON serializable
+            try:
+                embeddings_list = []
+                for embedding in vectors:
+                    # Convert each embedding to a Python list and round values to reduce size
+                    emb_list = [float(round(val, 6)) for val in embedding.tolist()]
+                    embeddings_list.append(emb_list)
+                logger.info(f"Successfully converted embeddings to list format")
+            except Exception as e:
+                logger.error(f"Error converting embeddings to list: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise HTTPException(status_code=500, detail=f"Embedding conversion error: {str(e)}")
             
             # Prepare the data for insertion
             student_data = {
