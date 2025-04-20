@@ -10,6 +10,8 @@ from deepface import DeepFace
 from datetime import date
 from typing import List
 import logging
+import uvicorn
+
 logging.basicConfig(level=logging.INFO)
 
 embedding_dim = 512
@@ -146,3 +148,7 @@ async def save_attendance(
         content={"message": "Attendance saved", "saved": saved},
         status_code=201
     )
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=port, reload=True)
