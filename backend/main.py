@@ -17,7 +17,11 @@ faiss_index = faiss.IndexIDMap(faiss.IndexFlatL2(embedding_dim))
 students_map = {}
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-app = FastAPI()
+app = FastAPI(
+    title="Attendance System API",
+    description="API for student attendance tracking using facial recognition",
+    version="1.0.0"
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,6 +29,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+async def root():
+    return {"status": "healthy", "message": "Attendance System API is running"}
 
 def load_index():
     global faiss_index, students_map
