@@ -96,20 +96,24 @@ async def student_register(
         
         for i, img in enumerate([image1, image2, image3, image4], 1):
             try:
+                # Read image data
                 data = await img.read()
                 if not data:
                     raise HTTPException(status_code=400, detail=f"Image {i} is empty")
                     
-                # upload raw bytes to Supabase storage
+                # Upload image to Supabase
                 upload_image_to_supababse(data, f"{folder_path}/face_{i}.jpg")
-                # decode image for embedding
+                
+                # Process image for face embedding
                 nparr = np.frombuffer(data, dtype=np.uint8)
                 img_arr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 if img_arr is None:
                     raise HTTPException(status_code=400, detail=f"Failed to decode image {i}")
                     
+                # Generate face embedding
                 rep = DeepFace.represent(img_arr, model_name="Facenet512", enforce_detection=False)
                 vectors.append(rep[0]["embedding"])
+                
             except HTTPException as he:
                 raise he
             except Exception as e:
