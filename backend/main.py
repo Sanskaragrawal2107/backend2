@@ -81,40 +81,52 @@ async def student_register(
     image4: UploadFile = File(...),
 ):
     try:
-        logger.info(f"Registering student: {student_id}, {name}, {class_id}")
+        logger.info(f"Starting student registration process for student_id: {student_id}")
+        logger.info(f"Student details - Name: {name}, Class: {class_id}")
+        
         folder_path = f"{class_id}__{student_id}__{name}"
         vectors = []
         
         # Validate student_id format
         if not student_id.strip():
+            logger.error("Empty student ID provided")
             raise HTTPException(status_code=400, detail="Student ID cannot be empty")
             
         # Check if student already exists
+        logger.info(f"Checking if student {student_id} already exists")
         existing = supabase.table("students").select("student_id").eq("student_id", student_id).execute()
         if existing.data:
+            logger.error(f"Student with ID {student_id} already exists")
             raise HTTPException(status_code=400, detail=f"Student with ID {student_id} already exists")
         
         for i, img in enumerate([image1, image2, image3, image4], 1):
             try:
+                logger.info(f"Processing image {i} for student {student_id}")
                 # Read image data
                 data = await img.read()
                 if not data:
+                    logger.error(f"Image {i} is empty")
                     raise HTTPException(status_code=400, detail=f"Image {i} is empty")
                     
                 # Upload image to Supabase
+                logger.info(f"Uploading image {i} to Supabase")
                 upload_image_to_supababse(data, f"{folder_path}/face_{i}.jpg")
                 
                 # Process image for face embedding
+                logger.info(f"Generating face embedding for image {i}")
                 nparr = np.frombuffer(data, dtype=np.uint8)
                 img_arr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 if img_arr is None:
+                    logger.error(f"Failed to decode image {i}")
                     raise HTTPException(status_code=400, detail=f"Failed to decode image {i}")
                     
                 # Generate face embedding
                 rep = DeepFace.represent(img_arr, model_name="Facenet512", enforce_detection=False)
                 vectors.append(rep[0]["embedding"])
+                logger.info(f"Successfully generated embedding for image {i}")
                 
             except HTTPException as he:
+                logger.error(f"HTTP Exception in image {i} processing: {str(he)}")
                 raise he
             except Exception as e:
                 logger.error(f"Error processing image {i}: {str(e)}")
@@ -122,9 +134,11 @@ async def student_register(
                 raise HTTPException(status_code=400, detail=f"Error processing image {i}: {str(e)}")
 
         if not vectors:
+            logger.error("No valid face embeddings generated from images")
             raise HTTPException(status_code=400, detail="No valid face embeddings generated from images")
 
         try:
+            logger.info("Inserting student data into database")
             supabase.table("students").insert({
                 "student_id": student_id,
                 "name": name,
@@ -132,6 +146,7 @@ async def student_register(
                 "image_folder_path": folder_path,
                 "embeddings": vectors
             }).execute()
+            logger.info("Successfully inserted student data into database")
         except Exception as e:
             logger.error(f"Error inserting into database: {str(e)}")
             logger.error(traceback.format_exc())
@@ -139,6 +154,7 @@ async def student_register(
 
         return JSONResponse(content={"message": "registration successful"}, status_code=201)
     except HTTPException as he:
+        logger.error(f"HTTP Exception in registration: {str(he)}")
         raise he
     except Exception as e:
         logger.error(f"Registration failed: {str(e)}")
