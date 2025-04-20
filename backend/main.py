@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, Form, UploadFile, Body
+from fastapi import FastAPI, File, Form, UploadFile, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from backend.supabase_config import supabase
@@ -11,8 +11,10 @@ from datetime import date
 from typing import List
 import logging
 import uvicorn
+import traceback
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 embedding_dim = 512
 faiss_index = faiss.IndexIDMap(faiss.IndexFlatL2(embedding_dim))
@@ -34,7 +36,14 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"status": "healthy", "message": "Attendance System API is running"}
+    try:
+        # Test Supabase connection
+        supabase.table("students").select("count").execute()
+        return {"status": "healthy", "message": "Attendance System API is running"}
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
 
 def load_index():
     global faiss_index, students_map
@@ -71,25 +80,44 @@ async def student_register(
     image3: UploadFile = File(...),
     image4: UploadFile = File(...),
 ):
-    folder_path = f"{class_id}__{student_id}__{name}"
-    vectors = []
-    for i, img in enumerate([image1, image2, image3, image4], 1):
-        data = await img.read()
-        # upload raw bytes to Supabase storage
-        upload_image_to_supababse(data, f"{folder_path}/face_{i}.jpg")
-        # decode image for embedding
-        nparr = np.frombuffer(data, dtype=np.uint8)
-        img_arr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        rep = DeepFace.represent(img_arr, model_name="Facenet512", enforce_detection=False)
-        vectors.append(rep[0]["embedding"])
-    supabase.table("students").insert({
-        "student_id": student_id,
-        "name": name,
-        "class_id": class_id,
-        "image_folder_path": folder_path,
-        "embeddings": vectors
-    }).execute()
-    return JSONResponse(content={"message": "registeration successfull"}, status_code=201)
+    try:
+        logger.info(f"Registering student: {student_id}, {name}, {class_id}")
+        folder_path = f"{class_id}__{student_id}__{name}"
+        vectors = []
+        
+        for i, img in enumerate([image1, image2, image3, image4], 1):
+            try:
+                data = await img.read()
+                # upload raw bytes to Supabase storage
+                upload_image_to_supababse(data, f"{folder_path}/face_{i}.jpg")
+                # decode image for embedding
+                nparr = np.frombuffer(data, dtype=np.uint8)
+                img_arr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                rep = DeepFace.represent(img_arr, model_name="Facenet512", enforce_detection=False)
+                vectors.append(rep[0]["embedding"])
+            except Exception as e:
+                logger.error(f"Error processing image {i}: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise HTTPException(status_code=400, detail=f"Error processing image {i}: {str(e)}")
+
+        try:
+            supabase.table("students").insert({
+                "student_id": student_id,
+                "name": name,
+                "class_id": class_id,
+                "image_folder_path": folder_path,
+                "embeddings": vectors
+            }).execute()
+        except Exception as e:
+            logger.error(f"Error inserting into database: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+        return JSONResponse(content={"message": "registration successful"}, status_code=201)
+    except Exception as e:
+        logger.error(f"Registration failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/mark-attendance")
 async def mark_attendance(
