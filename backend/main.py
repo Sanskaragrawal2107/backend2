@@ -139,13 +139,29 @@ async def student_register(
 
         try:
             logger.info("Inserting student data into database")
-            supabase.table("students").insert({
+            logger.info(f"Student data: student_id={student_id}, name={name}, class_id={class_id}")
+            logger.info(f"Number of embeddings: {len(vectors)}")
+            
+            # Convert numpy arrays to lists for Supabase
+            embeddings_list = [embedding.tolist() for embedding in vectors]
+            
+            # Prepare the data for insertion
+            student_data = {
                 "student_id": student_id,
                 "name": name,
                 "class_id": class_id,
                 "image_folder_path": folder_path,
-                "embeddings": vectors
-            }).execute()
+                "embeddings": embeddings_list
+            }
+            
+            logger.info("Attempting database insertion...")
+            response = supabase.table("students").insert(student_data).execute()
+            logger.info(f"Database insertion response: {response}")
+            
+            if hasattr(response, 'error') and response.error:
+                logger.error(f"Database insertion error: {response.error}")
+                raise HTTPException(status_code=500, detail=f"Database error: {response.error}")
+                
             logger.info("Successfully inserted student data into database")
         except Exception as e:
             logger.error(f"Error inserting into database: {str(e)}")
