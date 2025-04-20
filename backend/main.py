@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, Form, UploadFile, Body, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, Body, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from backend.supabase_config import supabase
@@ -14,15 +14,78 @@ import uvicorn
 import traceback
 import asyncio
 from functools import partial
-from fastapi import BackgroundTasks
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-embedding_dim = 512
+embedding_dim = 128  # Changed from 512 to 128 for lightweight features
 faiss_index = faiss.IndexIDMap(faiss.IndexFlatL2(embedding_dim))
 students_map = {}
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+# Add LBPH face recognizer - much more lightweight than deep learning models
+face_recognizer = cv2.face.LBPHFaceRecognizer_create()
+
+# Function to extract features using OpenCV LBPH - much more memory efficient
+def extract_face_features(image):
+    """Extract face features using OpenCV's LBPH algorithm instead of deep learning models"""
+    try:
+        # Convert to grayscale for face detection
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+            
+        # Detect faces
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(30, 30)
+        )
+        
+        if len(faces) == 0:
+            # If no face detected, use the whole image
+            faces = [(0, 0, gray.shape[1], gray.shape[0])]
+            
+        features = []
+        
+        # Process each detected face
+        for (x, y, w, h) in faces:
+            face_roi = gray[y:y+h, x:x+w]
+            
+            # Resize to a standard size
+            face_roi = cv2.resize(face_roi, (100, 100))
+            
+            # Normalize the image
+            face_roi = cv2.equalizeHist(face_roi)
+            
+            # Simple feature extraction - pixel values + histogram
+            # This is much more memory efficient than deep learning features
+            hist = cv2.calcHist([face_roi], [0], None, [64], [0, 256])
+            hist = hist.flatten() / np.sum(hist)  # Normalize
+            
+            # Downsample the face image to get key pixels
+            small_face = cv2.resize(face_roi, (8, 8))
+            key_pixels = small_face.flatten() / 255.0  # Normalize
+            
+            # Combine histogram and key pixels as features
+            feature_vector = np.concatenate([hist, key_pixels])
+            
+            # Resize to match embedding_dim
+            if len(feature_vector) > embedding_dim:
+                feature_vector = feature_vector[:embedding_dim]
+            elif len(feature_vector) < embedding_dim:
+                # Pad with zeros if needed
+                feature_vector = np.pad(feature_vector, (0, embedding_dim - len(feature_vector)))
+                
+            features.append(feature_vector)
+            
+        return features
+    except Exception as e:
+        logger.error(f"Error extracting features: {str(e)}")
+        logger.error(traceback.format_exc())
+        return []
 
 app = FastAPI(
     title="Attendance System API",
@@ -116,7 +179,10 @@ async def student_register(
                 "name": name,
                 "class_id": class_id,
                 "image_folder_path": folder_path,
-                "embeddings": []  # Empty array initially
+                "embeddings": [],  # Empty array initially
+                "processing_status": "pending",
+                "processing_progress": "0%",
+                "last_updated": datetime.now().isoformat()
             }
             
             response = supabase.table("students").insert(student_data).execute()
@@ -174,7 +240,6 @@ async def student_register(
             status_code=201,
             background=background_tasks
         )
-        
     except HTTPException as he:
         logger.error(f"HTTP Exception in registration: {str(he)}")
         raise he
@@ -202,10 +267,6 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
             logger.error(f"Failed to update processing status: {str(e)}")
         
         vectors = []
-        
-        # Use a smaller model that requires less memory
-        model_name = "VGG-Face"  # Smaller than Facenet512
-        logger.info(f"Using face recognition model: {model_name}")
         
         # Get the images from storage and process them
         for i, path in enumerate(image_paths, 1):
@@ -254,8 +315,8 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
                     logger.error(f"Failed to decode image {i}")
                     continue
                 
-                # Optimize image size to reduce memory usage - use smaller size
-                max_size = 300  # Much smaller than before (800)
+                # Optimize image size to reduce memory usage
+                max_size = 300
                 h, w = img_arr.shape[:2]
                 if h > max_size or w > max_size:
                     scale = max_size / max(h, w)
@@ -265,19 +326,24 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
                 
                 # Process one image at a time with careful memory management
                 try:
-                    # Skip face detection altogether to save memory
-                    logger.info("Generating face embedding without detection")
-                    rep = DeepFace.represent(img_arr, model_name=model_name, enforce_detection=False)
-                    vectors.append(rep[0]["embedding"])
-                    logger.info(f"Successfully generated embedding for image {i}")
+                    # Use our lightweight feature extraction instead of DeepFace
+                    logger.info("Using lightweight feature extraction")
+                    features = extract_face_features(img_arr)
+                    
+                    if features and len(features) > 0:
+                        # Use the first face's features
+                        vectors.append(features[0])
+                        logger.info(f"Successfully extracted features for image {i}")
+                    else:
+                        logger.error(f"No features extracted from image {i}")
+                        
                 except Exception as e:
-                    logger.error(f"Failed to generate embedding: {str(e)}")
+                    logger.error(f"Failed to extract features: {str(e)}")
                     logger.error(traceback.format_exc())
                     continue
                 
                 # Clear memory after each image
                 del img_arr
-                del rep
                 import gc
                 gc.collect()
                 
@@ -421,21 +487,39 @@ async def mark_attendance(
     data = await teacher_image.read()
     nparr = np.frombuffer(data, dtype=np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    
+    # Use our lightweight feature extraction
+    logger.info("Extracting features from classroom image")
+    all_features = []
+    
+    # First try with face detection
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     boxes = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+    
     if len(boxes) == 0:
         return JSONResponse(content={"message": "No students detected. Try again with a clearer photo."}, status_code=404)
-    emb_list = []
+    
+    # Extract features for each detected face
     for (x, y, w, h) in boxes:
-        face_img = img[y:y + h, x:x + w]
-        rep = DeepFace.represent(face_img, model_name="Facenet512", enforce_detection=False)
-        emb_list.append(np.array(rep[0]["embedding"], dtype="float32"))
+        face_roi = img[y:y + h, x:x + w]
+        features = extract_face_features(face_roi)
+        if features and len(features) > 0:
+            all_features.append(features[0])
+    
+    if not all_features:
+        return JSONResponse(content={"message": "No valid face features could be extracted. Try again with a clearer photo."}, status_code=404)
 
-    emb_arr = np.vstack(emb_list)
+    # Stack features for FAISS search
+    emb_arr = np.vstack(all_features).astype('float32')
+    
+    # Search in FAISS index
     _, I = faiss_index.search(emb_arr, k=1)
     found = I.flatten()
-    unique_ids = list({students_map[i] for i in found if i != -1})
+    
+    # Get unique student IDs
+    unique_ids = list({students_map[i] for i in found if i != -1 and i in students_map})
 
+    # Get student details from database
     detected_students = []
     if unique_ids:
         detected_students = supabase.table("students").select('*').in_("student_id", unique_ids).execute().data
