@@ -178,8 +178,7 @@ async def student_register(
                 "image_folder_path": folder_path,
                 "embeddings": [],  # Empty array initially
                 "processing_status": "pending",
-                "processing_progress": "0%",
-                "last_updated": datetime.now().isoformat()
+                "processing_progress": "0%"
             }
             
             response = supabase.table("students").insert(student_data).execute()
@@ -255,8 +254,7 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
         try:
             progress_data = {
                 "processing_status": "started",
-                "processing_progress": "0%",
-                "last_updated": datetime.now().isoformat()
+                "processing_progress": "0%"
             }
             supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
             logger.info(f"Updated processing status to 'started' for student {student_id}")
@@ -272,8 +270,7 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
                 progress_percent = int((i-1) / len(image_paths) * 100)
                 progress_data = {
                     "processing_status": "processing",
-                    "processing_progress": f"{progress_percent}%",
-                    "last_updated": datetime.now().isoformat()
+                    "processing_progress": f"{progress_percent}%"
                 }
                 supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
                 logger.info(f"Progress: {progress_percent}% for student {student_id}")
@@ -354,8 +351,7 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
             # Update status to failed
             progress_data = {
                 "processing_status": "failed",
-                "processing_progress": "0%",
-                "last_updated": datetime.now().isoformat()
+                "processing_progress": "0%"
             }
             supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
             return
@@ -363,8 +359,7 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
         # Update progress
         progress_data = {
             "processing_status": "converting",
-            "processing_progress": "80%",
-            "last_updated": datetime.now().isoformat()
+            "processing_progress": "80%"
         }
         supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
         
@@ -397,8 +392,7 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
             # Update status to failed
             progress_data = {
                 "processing_status": "failed",
-                "processing_progress": "80%",
-                "last_updated": datetime.now().isoformat()
+                "processing_progress": "80%"
             }
             supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
             return
@@ -406,8 +400,7 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
         # Update progress
         progress_data = {
             "processing_status": "saving",
-            "processing_progress": "90%",
-            "last_updated": datetime.now().isoformat()
+            "processing_progress": "90%"
         }
         supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
         
@@ -421,8 +414,7 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
                 response = supabase.table("students").update({
                     "embeddings": embeddings_list,
                     "processing_status": "complete",
-                    "processing_progress": "100%",
-                    "last_updated": datetime.now().isoformat()
+                    "processing_progress": "100%"
                 }).eq("student_id", student_id).execute()
                 
                 if hasattr(response, 'error') and response.error:
@@ -443,8 +435,7 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
                 # Update status to failed
                 progress_data = {
                     "processing_status": "failed",
-                    "processing_progress": "90%",
-                    "last_updated": datetime.now().isoformat()
+                    "processing_progress": "90%"
                 }
                 supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
             
@@ -454,8 +445,7 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
             # Update status to failed
             progress_data = {
                 "processing_status": "failed",
-                "processing_progress": "90%",
-                "last_updated": datetime.now().isoformat()
+                "processing_progress": "90%"
             }
             supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
             
@@ -466,8 +456,7 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
         try:
             progress_data = {
                 "processing_status": "failed",
-                "processing_progress": "0%",
-                "last_updated": datetime.now().isoformat()
+                "processing_progress": "0%"
             }
             supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
         except:
@@ -569,7 +558,6 @@ async def check_embeddings(student_id: str):
         embeddings = student_data.get("embeddings", [])
         processing_status = student_data.get("processing_status", "unknown")
         processing_progress = student_data.get("processing_progress", "0%")
-        last_updated = student_data.get("last_updated", None)
         
         # If embeddings exist and are not empty
         if embeddings and len(embeddings) > 0:
@@ -580,7 +568,6 @@ async def check_embeddings(student_id: str):
                 "embedding_status": "complete",
                 "processing_status": processing_status,
                 "processing_progress": processing_progress,
-                "last_updated": last_updated,
                 "embeddings_count": len(embeddings),
                 "embedding_dimensions": len(embeddings[0]) if len(embeddings) > 0 else 0,
                 "processing_complete": True,
@@ -611,7 +598,6 @@ async def check_embeddings(student_id: str):
             "embedding_status": "pending",
             "processing_status": processing_status,
             "processing_progress": processing_progress,
-            "last_updated": last_updated,
             "embeddings_count": 0,
             "processing_complete": processing_complete,
             "message": message
