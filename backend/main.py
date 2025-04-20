@@ -177,8 +177,7 @@ async def student_register(
                 "class_id": class_id,
                 "image_folder_path": folder_path,
                 "embeddings": [],  # Empty array initially
-                "processing_status": "pending",
-                "processing_progress": "0%"
+                "processing_status": "pending"
             }
             
             response = supabase.table("students").insert(student_data).execute()
@@ -253,8 +252,7 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
         # Track processing progress in database
         try:
             progress_data = {
-                "processing_status": "started",
-                "processing_progress": "0%"
+                "processing_status": "started"
             }
             supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
             logger.info(f"Updated processing status to 'started' for student {student_id}")
@@ -266,14 +264,15 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
         # Get the images from storage and process them
         for i, path in enumerate(image_paths, 1):
             try:
-                # Update progress
-                progress_percent = int((i-1) / len(image_paths) * 100)
-                progress_data = {
-                    "processing_status": "processing",
-                    "processing_progress": f"{progress_percent}%"
-                }
-                supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
-                logger.info(f"Progress: {progress_percent}% for student {student_id}")
+                # Set status to processing if this is the first image
+                if i == 1:
+                    try:
+                        supabase.table("students").update({"processing_status": "processing"}).eq("student_id", student_id).execute()
+                        logger.info(f"Updated status to 'processing' for student {student_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to update processing status: {str(e)}")
+                
+                logger.info(f"Processing image {i} of {len(image_paths)} for student {student_id}")
                 
                 # Get image from Supabase storage
                 bucket_name = "studentfaces"
@@ -350,16 +349,14 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
             logger.error("No valid face embeddings generated from images")
             # Update status to failed
             progress_data = {
-                "processing_status": "failed",
-                "processing_progress": "0%"
+                "processing_status": "failed"
             }
             supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
             return
         
         # Update progress
         progress_data = {
-            "processing_status": "converting",
-            "processing_progress": "80%"
+            "processing_status": "converting"
         }
         supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
         
@@ -391,16 +388,14 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
             logger.error(traceback.format_exc())
             # Update status to failed
             progress_data = {
-                "processing_status": "failed",
-                "processing_progress": "80%"
+                "processing_status": "failed"
             }
             supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
             return
         
         # Update progress
         progress_data = {
-            "processing_status": "saving",
-            "processing_progress": "90%"
+            "processing_status": "saving"
         }
         supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
         
@@ -413,8 +408,7 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
                 # Update database
                 response = supabase.table("students").update({
                     "embeddings": embeddings_list,
-                    "processing_status": "complete",
-                    "processing_progress": "100%"
+                    "processing_status": "complete"
                 }).eq("student_id", student_id).execute()
                 
                 if hasattr(response, 'error') and response.error:
@@ -434,8 +428,7 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
                 logger.error("No embeddings to update")
                 # Update status to failed
                 progress_data = {
-                    "processing_status": "failed",
-                    "processing_progress": "90%"
+                    "processing_status": "failed"
                 }
                 supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
             
@@ -444,8 +437,7 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
             logger.error(traceback.format_exc())
             # Update status to failed
             progress_data = {
-                "processing_status": "failed",
-                "processing_progress": "90%"
+                "processing_status": "failed"
             }
             supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
             
@@ -455,8 +447,7 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
         # Update status to failed
         try:
             progress_data = {
-                "processing_status": "failed",
-                "processing_progress": "0%"
+                "processing_status": "failed"
             }
             supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
         except:
@@ -557,7 +548,6 @@ async def check_embeddings(student_id: str):
         student_data = response.data[0]
         embeddings = student_data.get("embeddings", [])
         processing_status = student_data.get("processing_status", "unknown")
-        processing_progress = student_data.get("processing_progress", "0%")
         
         # If embeddings exist and are not empty
         if embeddings and len(embeddings) > 0:
@@ -567,7 +557,6 @@ async def check_embeddings(student_id: str):
                 "name": student_data.get("name", ""),
                 "embedding_status": "complete",
                 "processing_status": processing_status,
-                "processing_progress": processing_progress,
                 "embeddings_count": len(embeddings),
                 "embedding_dimensions": len(embeddings[0]) if len(embeddings) > 0 else 0,
                 "processing_complete": True,
@@ -583,7 +572,7 @@ async def check_embeddings(student_id: str):
         elif processing_status == "started":
             message = "Embedding processing has started"
         elif processing_status == "processing":
-            message = f"Embedding processing is in progress ({processing_progress})"
+            message = "Embedding processing is in progress"
         elif processing_status == "converting":
             message = "Converting embedding data format"
         elif processing_status == "saving":
@@ -591,13 +580,14 @@ async def check_embeddings(student_id: str):
         elif processing_status == "complete":
             message = "Embedding processing is complete but no embeddings were stored"
             processing_complete = True
+        elif processing_status == "pending":
+            message = "Embedding processing is waiting to begin"
             
         return {
             "student_id": student_id,
             "name": student_data.get("name", ""),
             "embedding_status": "pending",
             "processing_status": processing_status,
-            "processing_progress": processing_progress,
             "embeddings_count": 0,
             "processing_complete": processing_complete,
             "message": message
