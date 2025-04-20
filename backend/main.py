@@ -7,7 +7,7 @@ import os, cv2, pickle
 import numpy as np
 import faiss
 from deepface import DeepFace
-from datetime import date
+from datetime import date, datetime
 from typing import List
 import logging
 import uvicorn
@@ -189,6 +189,18 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
         logger.info(f"Starting background embedding processing for student {student_id}")
         logger.info(f"Processing {len(image_paths)} images")
         
+        # Track processing progress in database
+        try:
+            progress_data = {
+                "processing_status": "started",
+                "processing_progress": "0%",
+                "last_updated": datetime.now().isoformat()
+            }
+            supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
+            logger.info(f"Updated processing status to 'started' for student {student_id}")
+        except Exception as e:
+            logger.error(f"Failed to update processing status: {str(e)}")
+        
         vectors = []
         
         # Use a smaller model that requires less memory
@@ -198,6 +210,16 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
         # Get the images from storage and process them
         for i, path in enumerate(image_paths, 1):
             try:
+                # Update progress
+                progress_percent = int((i-1) / len(image_paths) * 100)
+                progress_data = {
+                    "processing_status": "processing",
+                    "processing_progress": f"{progress_percent}%",
+                    "last_updated": datetime.now().isoformat()
+                }
+                supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
+                logger.info(f"Progress: {progress_percent}% for student {student_id}")
+                
                 # Get image from Supabase storage
                 bucket_name = "studentfaces"
                 logger.info(f"Retrieving image {i} from storage: {path}")
@@ -266,7 +288,22 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
 
         if not vectors:
             logger.error("No valid face embeddings generated from images")
+            # Update status to failed
+            progress_data = {
+                "processing_status": "failed",
+                "processing_progress": "0%",
+                "last_updated": datetime.now().isoformat()
+            }
+            supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
             return
+        
+        # Update progress
+        progress_data = {
+            "processing_status": "converting",
+            "processing_progress": "80%",
+            "last_updated": datetime.now().isoformat()
+        }
+        supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
         
         # Convert embeddings to proper format for Supabase
         try:
@@ -294,7 +331,22 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
         except Exception as e:
             logger.error(f"Error converting embeddings to list: {str(e)}")
             logger.error(traceback.format_exc())
+            # Update status to failed
+            progress_data = {
+                "processing_status": "failed",
+                "processing_progress": "80%",
+                "last_updated": datetime.now().isoformat()
+            }
+            supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
             return
+        
+        # Update progress
+        progress_data = {
+            "processing_status": "saving",
+            "processing_progress": "90%",
+            "last_updated": datetime.now().isoformat()
+        }
+        supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
         
         # Update the student record with embeddings
         try:
@@ -304,7 +356,10 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
                 
                 # Update database
                 response = supabase.table("students").update({
-                    "embeddings": embeddings_list
+                    "embeddings": embeddings_list,
+                    "processing_status": "complete",
+                    "processing_progress": "100%",
+                    "last_updated": datetime.now().isoformat()
                 }).eq("student_id", student_id).execute()
                 
                 if hasattr(response, 'error') and response.error:
@@ -322,14 +377,38 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
                     logger.error(f"Error updating FAISS index: {str(e)}")
             else:
                 logger.error("No embeddings to update")
+                # Update status to failed
+                progress_data = {
+                    "processing_status": "failed",
+                    "processing_progress": "90%",
+                    "last_updated": datetime.now().isoformat()
+                }
+                supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
             
         except Exception as e:
             logger.error(f"Error updating embeddings in database: {str(e)}")
             logger.error(traceback.format_exc())
+            # Update status to failed
+            progress_data = {
+                "processing_status": "failed",
+                "processing_progress": "90%",
+                "last_updated": datetime.now().isoformat()
+            }
+            supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
             
     except Exception as e:
         logger.error(f"Background embedding processing failed: {str(e)}")
         logger.error(traceback.format_exc())
+        # Update status to failed
+        try:
+            progress_data = {
+                "processing_status": "failed",
+                "processing_progress": "0%",
+                "last_updated": datetime.now().isoformat()
+            }
+            supabase.table("students").update(progress_data).eq("student_id", student_id).execute()
+        except:
+            pass
 
 @app.post("/mark-attendance")
 async def mark_attendance(
@@ -388,6 +467,81 @@ async def save_attendance(
         content={"message": "Attendance saved", "saved": saved},
         status_code=201
     )
+
+@app.get("/check-embeddings/{student_id}")
+async def check_embeddings(student_id: str):
+    """
+    Check if embeddings have been processed and stored for a specific student.
+    Returns the status and details of the embeddings if available.
+    """
+    try:
+        logger.info(f"Checking embedding status for student: {student_id}")
+        
+        # Query the database for the student
+        response = supabase.table("students").select("*").eq("student_id", student_id).execute()
+        
+        if not response.data:
+            logger.error(f"Student {student_id} not found")
+            raise HTTPException(status_code=404, detail=f"Student with ID {student_id} not found")
+        
+        student_data = response.data[0]
+        embeddings = student_data.get("embeddings", [])
+        processing_status = student_data.get("processing_status", "unknown")
+        processing_progress = student_data.get("processing_progress", "0%")
+        last_updated = student_data.get("last_updated", None)
+        
+        # If embeddings exist and are not empty
+        if embeddings and len(embeddings) > 0:
+            logger.info(f"Found {len(embeddings)} embeddings for student {student_id}")
+            return {
+                "student_id": student_id,
+                "name": student_data.get("name", ""),
+                "embedding_status": "complete",
+                "processing_status": processing_status,
+                "processing_progress": processing_progress,
+                "last_updated": last_updated,
+                "embeddings_count": len(embeddings),
+                "embedding_dimensions": len(embeddings[0]) if len(embeddings) > 0 else 0,
+                "processing_complete": True,
+                "message": "Face embeddings have been successfully processed and stored"
+            }
+        
+        # If processing is ongoing or failed
+        processing_complete = False
+        message = "Embeddings are still being processed"
+        
+        if processing_status == "failed":
+            message = "Embedding processing failed"
+        elif processing_status == "started":
+            message = "Embedding processing has started"
+        elif processing_status == "processing":
+            message = f"Embedding processing is in progress ({processing_progress})"
+        elif processing_status == "converting":
+            message = "Converting embedding data format"
+        elif processing_status == "saving":
+            message = "Saving embeddings to database"
+        elif processing_status == "complete":
+            message = "Embedding processing is complete but no embeddings were stored"
+            processing_complete = True
+            
+        return {
+            "student_id": student_id,
+            "name": student_data.get("name", ""),
+            "embedding_status": "pending",
+            "processing_status": processing_status,
+            "processing_progress": processing_progress,
+            "last_updated": last_updated,
+            "embeddings_count": 0,
+            "processing_complete": processing_complete,
+            "message": message
+        }
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error checking embeddings: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error checking embeddings: {str(e)}")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
