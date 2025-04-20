@@ -14,6 +14,7 @@ import uvicorn
 import traceback
 import asyncio
 from functools import partial
+from fastapi import BackgroundTasks
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -84,21 +85,15 @@ async def student_register(
 ):
     """
     Register a new student with face images for attendance tracking.
-    
-    This endpoint:
-    1. Validates student information
-    2. Processes and uploads face images
-    3. Generates face embeddings
-    4. Saves student data to the database
-    
-    The face embedding process is resource-intensive and may take some time.
+    This endpoint now works in two phases:
+    1. Upload images and register student basic info
+    2. Process embeddings in a background task
     """
     try:
         logger.info(f"Starting student registration process for student_id: {student_id}")
         logger.info(f"Student details - Name: {name}, Class: {class_id}")
         
         folder_path = f"{class_id}__{student_id}__{name}"
-        vectors = []
         
         # Validate student_id format
         if not student_id.strip():
@@ -112,7 +107,32 @@ async def student_register(
             logger.error(f"Student with ID {student_id} already exists")
             raise HTTPException(status_code=400, detail=f"Student with ID {student_id} already exists")
         
-        # Process one image at a time to reduce memory usage
+        # First, register the student without embeddings to avoid timeout
+        try:
+            logger.info("Registering student basic information first")
+            student_data = {
+                "student_id": student_id,
+                "name": name,
+                "class_id": class_id,
+                "image_folder_path": folder_path,
+                "embeddings": []  # Empty array initially
+            }
+            
+            response = supabase.table("students").insert(student_data).execute()
+            logger.info(f"Initial student registration response: {response}")
+            
+            if hasattr(response, 'error') and response.error:
+                logger.error(f"Student registration error: {response.error}")
+                raise HTTPException(status_code=500, detail=f"Database error: {response.error}")
+                
+            logger.info("Successfully registered student basic information")
+        except Exception as e:
+            logger.error(f"Error registering student: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+        # Next, upload and process images one by one
+        image_paths = []
         for i, img in enumerate([image1, image2, image3, image4], 1):
             try:
                 logger.info(f"Processing image {i} for student {student_id}")
@@ -123,8 +143,60 @@ async def student_register(
                     raise HTTPException(status_code=400, detail=f"Image {i} is empty")
                     
                 # Upload image to Supabase
-                logger.info(f"Uploading image {i} to Supabase")
-                upload_image_to_supababse(data, f"{folder_path}/face_{i}.jpg")
+                image_path = f"{folder_path}/face_{i}.jpg"
+                logger.info(f"Uploading image {i} to Supabase at path: {image_path}")
+                upload_image_to_supababse(data, image_path)
+                image_paths.append(image_path)
+                logger.info(f"Successfully uploaded image {i}")
+                
+            except Exception as e:
+                logger.error(f"Error processing image {i}: {str(e)}")
+                logger.error(traceback.format_exc())
+                # Continue with other images instead of failing completely
+                continue
+
+        if not image_paths:
+            logger.error("No images were successfully uploaded")
+            raise HTTPException(status_code=400, detail="No images were successfully uploaded")
+
+        # Start background task to process embeddings
+        background_tasks = BackgroundTasks()
+        background_tasks.add_task(process_embeddings, student_id, image_paths)
+        
+        return JSONResponse(
+            content={
+                "message": "Student registered successfully. Face embeddings will be processed in the background.",
+                "student_id": student_id
+            },
+            status_code=201,
+            background=background_tasks
+        )
+        
+    except HTTPException as he:
+        logger.error(f"HTTP Exception in registration: {str(he)}")
+        raise he
+    except Exception as e:
+        logger.error(f"Registration failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+
+async def process_embeddings(student_id: str, image_paths: List[str]):
+    """Background task to process face embeddings and update the student record."""
+    try:
+        logger.info(f"Starting background embedding processing for student {student_id}")
+        logger.info(f"Processing {len(image_paths)} images")
+        
+        vectors = []
+        
+        # Get the images from storage and process them
+        for i, path in enumerate(image_paths, 1):
+            try:
+                # Get image from Supabase storage
+                bucket_name = "studentfaces"
+                logger.info(f"Retrieving image {i} from storage: {path}")
+                
+                response = supabase.storage.from_(bucket_name).download(path)
+                data = response
                 
                 # Process image for face embedding
                 logger.info(f"Generating face embedding for image {i}")
@@ -132,7 +204,7 @@ async def student_register(
                 img_arr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 if img_arr is None:
                     logger.error(f"Failed to decode image {i}")
-                    raise HTTPException(status_code=400, detail=f"Failed to decode image {i}")
+                    continue
                 
                 # Optimize image size to reduce memory usage
                 max_size = 800
@@ -143,9 +215,8 @@ async def student_register(
                     logger.info(f"Resizing image from {w}x{h} to {new_size[0]}x{new_size[1]}")
                     img_arr = cv2.resize(img_arr, new_size, interpolation=cv2.INTER_AREA)
                 
-                # Process face with error handling
+                # Try with face detection first
                 try:
-                    # Try with face detection first
                     logger.info("Attempting face embedding with detection")
                     rep = DeepFace.represent(img_arr, model_name="Facenet512", enforce_detection=True)
                     vectors.append(rep[0]["embedding"])
@@ -159,76 +230,55 @@ async def student_register(
                         logger.info(f"Successfully generated embedding for image {i} without face detection")
                     except Exception as e2:
                         logger.error(f"Failed to generate embedding without detection: {str(e2)}")
-                        raise Exception(f"Face embedding generation failed: {str(e2)}")
+                        continue
                 
                 # Clear memory
                 del img_arr
                 del nparr
-                # Force garbage collection to free memory
                 import gc
                 gc.collect()
                 
-            except HTTPException as he:
-                logger.error(f"HTTP Exception in image {i} processing: {str(he)}")
-                raise he
             except Exception as e:
                 logger.error(f"Error processing image {i}: {str(e)}")
                 logger.error(traceback.format_exc())
-                raise HTTPException(status_code=400, detail=f"Error processing image {i}: {str(e)}")
+                continue
 
         if not vectors:
             logger.error("No valid face embeddings generated from images")
-            raise HTTPException(status_code=400, detail="No valid face embeddings generated from images")
-
+            return
+        
+        # Convert embeddings to proper format for Supabase
         try:
-            logger.info("Inserting student data into database")
-            logger.info(f"Student data: student_id={student_id}, name={name}, class_id={class_id}")
-            logger.info(f"Number of embeddings: {len(vectors)}")
-            
-            # Convert numpy arrays to lists for Supabase and ensure it's JSON serializable
-            try:
-                embeddings_list = []
-                for embedding in vectors:
-                    # Convert each embedding to a Python list and round values to reduce size
-                    emb_list = [float(round(val, 6)) for val in embedding.tolist()]
-                    embeddings_list.append(emb_list)
-                logger.info(f"Successfully converted embeddings to list format")
-            except Exception as e:
-                logger.error(f"Error converting embeddings to list: {str(e)}")
-                logger.error(traceback.format_exc())
-                raise HTTPException(status_code=500, detail=f"Embedding conversion error: {str(e)}")
-            
-            # Prepare the data for insertion
-            student_data = {
-                "student_id": student_id,
-                "name": name,
-                "class_id": class_id,
-                "image_folder_path": folder_path,
-                "embeddings": embeddings_list
-            }
-            
-            logger.info("Attempting database insertion...")
-            response = supabase.table("students").insert(student_data).execute()
-            logger.info(f"Database insertion response: {response}")
-            
-            if hasattr(response, 'error') and response.error:
-                logger.error(f"Database insertion error: {response.error}")
-                raise HTTPException(status_code=500, detail=f"Database error: {response.error}")
-                
-            logger.info("Successfully inserted student data into database")
+            embeddings_list = []
+            for embedding in vectors:
+                emb_list = [float(round(val, 6)) for val in embedding.tolist()]
+                embeddings_list.append(emb_list)
+            logger.info(f"Successfully converted {len(embeddings_list)} embeddings to list format")
         except Exception as e:
-            logger.error(f"Error inserting into database: {str(e)}")
+            logger.error(f"Error converting embeddings to list: {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-        return JSONResponse(content={"message": "registration successful"}, status_code=201)
-    except HTTPException as he:
-        logger.error(f"HTTP Exception in registration: {str(he)}")
-        raise he
+            return
+        
+        # Update the student record with embeddings
+        try:
+            logger.info(f"Updating student {student_id} with {len(embeddings_list)} embeddings")
+            response = supabase.table("students").update({
+                "embeddings": embeddings_list
+            }).eq("student_id", student_id).execute()
+            
+            logger.info(f"Database update response: {response}")
+            logger.info(f"Successfully updated embeddings for student {student_id}")
+            
+            # After successful embedding update, update the FAISS index
+            load_index()
+            
+        except Exception as e:
+            logger.error(f"Error updating embeddings in database: {str(e)}")
+            logger.error(traceback.format_exc())
+            
     except Exception as e:
-        logger.error(f"Registration failed: {str(e)}")
+        logger.error(f"Background embedding processing failed: {str(e)}")
         logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
 
 @app.post("/mark-attendance")
 async def mark_attendance(
