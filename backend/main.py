@@ -23,12 +23,9 @@ faiss_index = faiss.IndexIDMap(faiss.IndexFlatL2(embedding_dim))
 students_map = {}
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-# Add LBPH face recognizer - much more lightweight than deep learning models
-face_recognizer = cv2.face.LBPHFaceRecognizer_create()
-
-# Function to extract features using OpenCV LBPH - much more memory efficient
+# Function to extract features using simple OpenCV methods - no face module required
 def extract_face_features(image):
-    """Extract face features using OpenCV's LBPH algorithm instead of deep learning models"""
+    """Extract face features using OpenCV histogram and pixel-based features"""
     try:
         # Convert to grayscale for face detection
         if len(image.shape) == 3:
