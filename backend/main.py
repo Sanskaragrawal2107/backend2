@@ -121,7 +121,7 @@ async def student_register(
 ):
     try:
         logger.info(f"Registering student: {student_id}, {name}, {class_id}")
-        folder_path = f"{class_id}__{student_id}__{name}"
+    folder_path = f"{class_id}__{student_id}__{name}"
         
         # Validate input
         if not student_id.strip():
@@ -134,10 +134,10 @@ async def student_register(
         
         # Register student basic info
         student_data = {
-            "student_id": student_id,
-            "name": name,
-            "class_id": class_id,
-            "image_folder_path": folder_path,
+        "student_id": student_id,
+        "name": name,
+        "class_id": class_id,
+        "image_folder_path": folder_path,
             "embeddings": []
         }
         
@@ -297,14 +297,14 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
         
         # Get image data
         start_time = datetime.now()
-        data = await teacher_image.read()
+    data = await teacher_image.read()
         if not data or len(data) < 1000:  # Basic size check
             return JSONResponse(content={"message": "Invalid image data"}, status_code=400)
             
         # Convert to numpy array with memory management
         try:
-            nparr = np.frombuffer(data, dtype=np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    nparr = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             # Free memory immediately
             del data
             gc.collect()
@@ -338,7 +338,7 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
             if len(face_locations) == 0:
                 # Fall back to OpenCV as backup
                 logger.info("Falling back to OpenCV face detection")
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                 boxes = face_cascade.detectMultiScale(
                     gray, 
                     scaleFactor=1.1,
@@ -346,12 +346,12 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
                     minSize=(30, 30)
                 )
                 
-                if len(boxes) == 0:
+    if len(boxes) == 0:
                     return JSONResponse(content={"message": "No faces detected"}, status_code=404)
                     
                 # Convert OpenCV boxes to face_recognition format (top, right, bottom, left)
                 face_locations = []
-                for (x, y, w, h) in boxes:
+    for (x, y, w, h) in boxes:
                     face_locations.append((y, x+w, y+h, x))
                     
                 logger.info(f"OpenCV fallback found {len(face_locations)} faces")
@@ -516,8 +516,8 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
             
         # Get student details
         try:
-            detected_students = []
-            if unique_ids:
+    detected_students = []
+    if unique_ids:
                 response = supabase.table("students").select('student_id,name,class_id').in_("student_id", unique_ids).execute()
                 detected_students = response.data
                 
@@ -600,6 +600,143 @@ async def check_embeddings(student_id: str):
     except Exception as e:
         logger.error(f"Error checking embeddings: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error checking embeddings: {str(e)}")
+
+@app.post("/reprocess-all-embeddings")
+async def reprocess_all_embeddings(background_tasks: BackgroundTasks = BackgroundTasks()):
+    """
+    Reprocess embeddings for all existing students using the new face_recognition model.
+    This is useful when switching from the old histogram method to face_recognition.
+    """
+    try:
+        # Get all students
+        logger.info("Starting to reprocess embeddings for all students")
+        response = supabase.table("students").select("*").execute()
+        students = response.data
+        
+        if not students:
+            return JSONResponse(
+                content={"message": "No students found in database"},
+                status_code=404
+            )
+            
+        # Queue background tasks to reprocess each student's images
+        reprocessed_count = 0
+        for student in students:
+            student_id = student.get("student_id")
+            folder_path = student.get("image_folder_path")
+            
+            if not student_id or not folder_path:
+                logger.warning(f"Missing data for student: {student_id}")
+                continue
+                
+            # Get image files from the folder
+            logger.info(f"Looking for images for student {student_id} in folder {folder_path}")
+            try:
+                # List files in the folder
+                bucket_name = "studentfaces"
+                list_response = supabase.storage.from_(bucket_name).list(folder_path)
+                
+                if not list_response:
+                    logger.warning(f"No images found for student {student_id}")
+                    continue
+                    
+                # Get full paths
+                image_paths = [f"{folder_path}/{file}" for file in list_response]
+                logger.info(f"Found {len(image_paths)} images for student {student_id}")
+                
+                # Queue the background task
+                if image_paths:
+                    background_tasks.add_task(process_embeddings, student_id, image_paths)
+                    reprocessed_count += 1
+                    
+            except Exception as e:
+                logger.error(f"Error getting images for student {student_id}: {str(e)}")
+                continue
+                
+        return JSONResponse(
+            content={
+                "message": f"Reprocessing embeddings for {reprocessed_count} students in the background",
+                "students_queued": reprocessed_count,
+                "total_students": len(students)
+            },
+            status_code=202,
+            background=background_tasks
+        )
+        
+    except Exception as e:
+        logger.error(f"Error reprocessing embeddings: {str(e)}")
+        return JSONResponse(
+            content={"message": f"Error reprocessing embeddings: {str(e)}"},
+            status_code=500
+        )
+        
+@app.post("/reprocess-student/{student_id}")
+async def reprocess_student_embeddings(student_id: str, background_tasks: BackgroundTasks = BackgroundTasks()):
+    """
+    Reprocess embeddings for a specific student using the new face_recognition model.
+    """
+    try:
+        # Get student data
+        logger.info(f"Starting to reprocess embeddings for student {student_id}")
+        response = supabase.table("students").select("*").eq("student_id", student_id).execute()
+        
+        if not response.data:
+            return JSONResponse(
+                content={"message": f"Student with ID {student_id} not found"},
+                status_code=404
+            )
+            
+        student = response.data[0]
+        folder_path = student.get("image_folder_path")
+        
+        if not folder_path:
+            return JSONResponse(
+                content={"message": f"No image folder found for student {student_id}"},
+                status_code=404
+            )
+            
+        # Get image files from the folder
+        try:
+            # List files in the folder
+            bucket_name = "studentfaces"
+            list_response = supabase.storage.from_(bucket_name).list(folder_path)
+            
+            if not list_response:
+                return JSONResponse(
+                    content={"message": f"No images found for student {student_id}"},
+                    status_code=404
+                )
+                
+            # Get full paths
+            image_paths = [f"{folder_path}/{file}" for file in list_response]
+            logger.info(f"Found {len(image_paths)} images for student {student_id}")
+            
+            # Queue the background task
+            background_tasks.add_task(process_embeddings, student_id, image_paths)
+            
+            return JSONResponse(
+                content={
+                    "message": f"Reprocessing embeddings for student {student_id} with {len(image_paths)} images",
+                    "student_id": student_id,
+                    "images_found": len(image_paths)
+                },
+                status_code=202,
+                background=background_tasks
+            )
+                
+        except Exception as e:
+            logger.error(f"Error getting images for student {student_id}: {str(e)}")
+            return JSONResponse(
+                content={"message": f"Error processing images: {str(e)}"},
+                status_code=500
+            )
+            
+    except Exception as e:
+        logger.error(f"Error reprocessing student embeddings: {str(e)}")
+        return JSONResponse(
+            content={"message": f"Error reprocessing embeddings: {str(e)}"},
+            status_code=500
+        )
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
