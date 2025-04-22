@@ -12,62 +12,50 @@ import uvicorn
 import traceback
 import gc
 from typing import List
+import face_recognition  # Add face_recognition library
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Change to face_recognition encoding size (128-dimensional)
 embedding_dim = 128
 faiss_index = faiss.IndexIDMap(faiss.IndexFlatL2(embedding_dim))
 students_map = {}
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 def extract_face_features(image):
-    """Extract face features using OpenCV histogram and pixel-based features"""
+    """Extract face features using face_recognition library for better accuracy"""
     try:
-        # Convert to grayscale for face detection
+        # Convert BGR to RGB (face_recognition uses RGB)
         if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         else:
-            gray = image
+            # If grayscale, convert to RGB
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
             
-        # Detect faces
-        faces = face_cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
-        )
+        # Find face locations
+        face_locations = face_recognition.face_locations(rgb_image, model="hog")
         
-        if len(faces) == 0:
-            # If no face detected, use the whole image
-            faces = [(0, 0, gray.shape[1], gray.shape[0])]
+        if not face_locations:
+            logger.info("No faces found with face_recognition")
+            return []
             
+        # Get face encodings
+        face_encodings = face_recognition.face_encodings(rgb_image, face_locations)
+        
+        if not face_encodings:
+            logger.info("Could not extract encodings")
+            return []
+            
+        # Convert each encoding to the same format as before
         features = []
-        
-        # Process each detected face
-        for (x, y, w, h) in faces:
-            face_roi = gray[y:y+h, x:x+w]
-            face_roi = cv2.resize(face_roi, (100, 100))
-            face_roi = cv2.equalizeHist(face_roi)
-            
-            # Extract features - histogram + key pixels
-            hist = cv2.calcHist([face_roi], [0], None, [64], [0, 256])
-            hist = hist.flatten() / np.sum(hist)
-            
-            small_face = cv2.resize(face_roi, (8, 8))
-            key_pixels = small_face.flatten() / 255.0
-            
-            # Combine and ensure correct dimension
-            feature_vector = np.concatenate([hist, key_pixels])
-            
-            # Ensure exact embedding_dim length
-            if len(feature_vector) > embedding_dim:
-                feature_vector = feature_vector[:embedding_dim]
-            elif len(feature_vector) < embedding_dim:
-                feature_vector = np.pad(feature_vector, (0, embedding_dim - len(feature_vector)))
-                
-            features.append(feature_vector)
+        for encoding in face_encodings:
+            # face_recognition encodings are already normalized 128-dimensional vectors
+            features.append(encoding)
             
         return features
     except Exception as e:
-        logger.error(f"Error extracting features: {str(e)}")
+        logger.error(f"Error extracting features with face_recognition: {str(e)}")
         return []
 
 app = FastAPI(
@@ -219,20 +207,16 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
                 if img_arr is None:
                     continue
                 
-                # Resize large images to save memory
-                max_size = 300
-                h, w = img_arr.shape[:2]
-                if h > max_size or w > max_size:
-                    scale = max_size / max(h, w)
-                    img_arr = cv2.resize(img_arr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+                # No need to resize - face_recognition handles this
                 
-                # Extract features
+                # Extract features using face_recognition
                 features = extract_face_features(img_arr)
                 if features and len(features) > 0:
                     feature_vec = features[0]
-                    # Log dimensions to debug the 520 vs 128 issue
-                    logger.info(f"Feature vector dimensions: {len(feature_vec)}")
+                    logger.info(f"Face recognition encoding dimensions: {len(feature_vec)}")
                     vectors.append(feature_vec)
+                else:
+                    logger.warning(f"No face found in image {i} for student {student_id}")
                 
                 # Clear memory
                 del img_arr, features
@@ -246,11 +230,10 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
             logger.error("No valid face embeddings generated")
             return
         
-        # Convert embeddings for storage
+        # Convert embeddings for storage - face_recognition encodings are already 128-dim
         embeddings_list = []
         for embedding in vectors:
-            # Ensure exactly embedding_dim dimensions
-            emb_list = [float(round(val, 4)) for val in embedding.tolist()[:embedding_dim]]
+            emb_list = [float(val) for val in embedding.tolist()]
             embeddings_list.append(emb_list)
             
         # Update database with embeddings
@@ -340,204 +323,163 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
             logger.error(f"Image decoding error: {str(e)}")
             return JSONResponse(content={"message": "Error processing image"}, status_code=400)
             
-        # Extract features from classroom image
+        # Using face_recognition for better accuracy
         all_features = []
-        face_positions = []  # Store face positions for visualization/debugging
+        face_positions = []
         try:
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            # Convert to RGB for face_recognition
+            rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
-            # Try two different face detection methods
-            # 1. Standard Haar cascade
-            boxes1 = face_cascade.detectMultiScale(
-                gray, 
-                scaleFactor=1.1,      # Less aggressive scaling (better detection)
-                minNeighbors=4,       # More strict to avoid false positives
-                minSize=(30, 30)      # Slightly larger minimum face size
-            )
+            # Detect faces using face_recognition
+            logger.info("Using face_recognition to detect faces")
+            face_locations = face_recognition.face_locations(rgb_img, model="hog")
+            logger.info(f"face_recognition found {len(face_locations)} faces")
             
-            logger.info(f"Haar cascade found {len(boxes1)} faces")
-            
-            # 2. More aggressive parameters for missed faces
-            boxes2 = face_cascade.detectMultiScale(
-                gray, 
-                scaleFactor=1.05,   # Very gradual scaling
-                minNeighbors=3,     # Balanced threshold
-                minSize=(20, 20)    # Smaller faces
-            )
-            logger.info(f"Aggressive parameters found {len(boxes2)} faces")
-            
-            # Combine, remove duplicates and sort by area (largest first)
-            all_boxes = []
-            
-            # Add boxes from first method
-            for box in boxes1:
-                all_boxes.append(tuple(box))
+            if len(face_locations) == 0:
+                # Fall back to OpenCV as backup
+                logger.info("Falling back to OpenCV face detection")
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                boxes = face_cascade.detectMultiScale(
+                    gray, 
+                    scaleFactor=1.1,
+                    minNeighbors=4,
+                    minSize=(30, 30)
+                )
                 
-            # Add boxes from second method, avoiding duplicates
-            for box in boxes2:
-                x, y, w, h = box
-                center_x, center_y = x + w//2, y + h//2
-                
-                # Check if this is a duplicate (significantly overlapping with existing box)
-                is_duplicate = False
-                for existing_box in all_boxes:
-                    ex, ey, ew, eh = existing_box
-                    ecx, ecy = ex + ew//2, ey + eh//2
+                if len(boxes) == 0:
+                    return JSONResponse(content={"message": "No faces detected"}, status_code=404)
                     
-                    # If centers are close, consider it a duplicate
-                    if abs(center_x - ecx) < w//2 and abs(center_y - ecy) < h//2:
-                        is_duplicate = True
-                        break
-                        
-                if not is_duplicate:
-                    all_boxes.append(tuple(box))
+                # Convert OpenCV boxes to face_recognition format (top, right, bottom, left)
+                face_locations = []
+                for (x, y, w, h) in boxes:
+                    face_locations.append((y, x+w, y+h, x))
+                    
+                logger.info(f"OpenCV fallback found {len(face_locations)} faces")
             
-            # Sort by area (largest first)
-            all_boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
+            # Get face encodings for all detected faces
+            face_encodings = face_recognition.face_encodings(rgb_img, face_locations)
+            logger.info(f"Got {len(face_encodings)} face encodings")
             
-            if len(all_boxes) == 0:
-                return JSONResponse(content={"message": "No faces detected"}, status_code=404)
-            
-            logger.info(f"Combined detection found {len(all_boxes)} unique faces")
-            
-            # Set a limit for processing
-            if len(all_boxes) > 50:  # Increased limit for larger classrooms
-                logger.warning(f"Too many faces detected ({len(all_boxes)}), limiting to 50")
-                all_boxes = all_boxes[:50]
-                
-            # Get features for each face with detailed match information for debugging
-            found_ids = []
-            face_count = 0
-            
-            for (x, y, w, h) in all_boxes:
-                face_roi = img[y:y + h, x:x + w]
-                face_count += 1
+            # Store face positions for response info
+            for top, right, bottom, left in face_locations:
+                x, y = left, top
+                w, h = right - left, bottom - top
                 face_positions.append((x, y, w, h))
-                logger.info(f"Processing face {face_count} at position ({x},{y}) with size {w}x{h}")
                 
-                # Attempt to improve feature quality
-                try:
-                    # Try to enhance the face for better feature extraction
-                    face_roi = cv2.resize(face_roi, (120, 120))  # Larger size for more detail
-                    features = extract_face_features(face_roi)
+            # Process each face
+            found_ids = []
+            for i, (encoding, location) in enumerate(zip(face_encodings, face_locations)):
+                top, right, bottom, left = location
+                face_count = i + 1
+                logger.info(f"Processing face {face_count} at position ({left},{top}) with size {right-left}x{bottom-top}")
+                
+                if encoding is not None and len(encoding) == embedding_dim:
+                    all_features.append(encoding)
                     
-                    if features and len(features) > 0:
-                        all_features.append(features[0])
+                    # Try to identify this face
+                    try:
+                        face_emb = np.array([encoding]).astype('float32')
                         
-                        # Debug identification for individual face
-                        try:
-                            face_emb = np.array([features[0]]).astype('float32')
+                        # Check FAISS index
+                        if faiss_index.ntotal == 0:
+                            logger.error("FAISS index is empty, skipping match")
+                            continue
                             
-                            # Double-check FAISS index here
-                            if faiss_index.ntotal == 0:
-                                logger.error("FAISS index is still empty in face loop, skipping match")
-                                continue
-                                
-                            face_distances, face_I = faiss_index.search(face_emb, k=3)  # Get top 3 matches for verification
+                        # Use lower distance threshold with face_recognition (it's more accurate)
+                        # Usually 0.6 is a good threshold for face_recognition
+                        face_distances, face_I = faiss_index.search(face_emb, k=3)
+                        
+                        # Lower threshold for face_recognition (L2 distance)
+                        max_distance = 0.8  # This is much stricter than before
+                        
+                        closest_distance = face_distances[0][0]
+                        closest_id = face_I[0][0]
+                        
+                        logger.info(f"Face {face_count} closest match distance: {closest_distance}")
+                        
+                        if closest_distance <= max_distance and closest_id != -1 and closest_id in students_map:
+                            student_id = students_map[closest_id]
+                            found_ids.append((student_id, closest_distance))
+                            logger.info(f"Face {face_count} matched with student_id: {student_id} at distance {closest_distance}")
                             
-                            # Use a more relaxed distance threshold for testing
-                            max_distance = 200.0  # Increased from 100 for testing
-                            
-                            closest_distance = face_distances[0][0]
-                            closest_id = face_I[0][0]
-                            
-                            logger.info(f"Face {face_count} closest match distance: {closest_distance}")
-                            
-                            if closest_distance <= max_distance and closest_id != -1 and closest_id in students_map:
-                                student_id = students_map[closest_id]
-                                found_ids.append((student_id, closest_distance))
-                                logger.info(f"Face {face_count} matched with student_id: {student_id} at distance {closest_distance}")
-                                
-                                # Log alternative matches for debugging
-                                if len(face_I[0]) > 1:
-                                    for i in range(1, min(3, len(face_I[0]))):
-                                        alt_id = face_I[0][i]
-                                        alt_dist = face_distances[0][i] 
-                                        if alt_id != -1 and alt_id in students_map:
-                                            logger.info(f"  Alternative match {i}: {students_map[alt_id]} at distance {alt_dist}")
+                            # Log alternatives
+                            for j in range(1, min(3, len(face_I[0]))):
+                                alt_id = face_I[0][j]
+                                alt_dist = face_distances[0][j]
+                                if alt_id != -1 and alt_id in students_map:
+                                    logger.info(f"  Alternative match {j}: {students_map[alt_id]} at distance {alt_dist}")
+                        else:
+                            if closest_distance > max_distance:
+                                logger.info(f"Face {face_count} exceeded distance threshold ({closest_distance} > {max_distance})")
                             else:
-                                if closest_distance > max_distance:
-                                    logger.info(f"Face {face_count} exceeded distance threshold ({closest_distance} > {max_distance})")
-                                else:
-                                    logger.info(f"Face {face_count} did not match any known student")
-                        except Exception as e:
-                            logger.error(f"Error during face identification: {e}")
-                    else:
-                        logger.info(f"No features extracted for face {face_count}")
-                        
-                except Exception as e:
-                    logger.error(f"Error processing face {face_count}: {e}")
-                    continue
+                                logger.info(f"Face {face_count} did not match any known student")
+                    except Exception as e:
+                        logger.error(f"Error during face identification: {e}")
+                else:
+                    logger.info(f"No valid encoding for face {face_count}")
                     
-                # Break if processing is taking too long
-                if (datetime.now() - start_time).total_seconds() > 25:  # 25 sec limit
-                    logger.warning("Face detection taking too long, stopping early")
+                # Check timeout
+                if (datetime.now() - start_time).total_seconds() > 25:
+                    logger.warning("Face processing taking too long, stopping early")
                     break
                     
-            # Clean up memory  
-            del img, gray
+            # Clean up memory
+            del img, rgb_img
             gc.collect()
-                
+            
             if not all_features:
                 return JSONResponse(content={"message": "No valid face features extracted"}, status_code=404)
-               
-            logger.info(f"Extracted features for {len(all_features)} out of {len(all_boxes)} detected faces")
-            logger.info(f"Preliminary matches: {found_ids}")
                 
+            logger.info(f"Extracted {len(all_features)} face encodings")
+            logger.info(f"Preliminary matches: {found_ids}")
+            
         except Exception as e:
             logger.error(f"Face detection error: {str(e)}")
-            return JSONResponse(content={"message": "Error detecting faces"}, status_code=500)
+            return JSONResponse(content={"message": f"Error detecting faces: {str(e)}"}, status_code=500)
             
-        # Search in FAISS index with improved confidence thresholds
+        # Search in FAISS index with proper thresholds for face_recognition
         try:
-            # Final check on FAISS index before searching
+            # Final check on FAISS index
             if faiss_index.ntotal == 0:
-                # One last attempt to reload
-                logger.error("FAISS index still empty before final search, attempting one last reload")
+                logger.error("FAISS index empty before search, attempting reload")
                 load_index()
                 
                 if faiss_index.ntotal == 0:
-                    # If still empty, return detailed error
-                    logger.error("FAISS index remains empty after reload attempts")
                     return JSONResponse(
                         content={
-                            "message": "Student database exists but embeddings couldn't be loaded into search index",
+                            "message": "No student data available in search index",
                             "debug_info": {
                                 "faiss_ntotal": 0,
                                 "students_map_size": len(students_map),
-                                "faces_detected": len(face_positions),
-                                "features_extracted": len(all_features)
+                                "faces_detected": len(face_positions)
                             }
-                        }, 
-                        status_code=500
+                        },
+                        status_code=404
                     )
                     
-            # Use a more relaxed distance threshold for testing
-            MAX_DISTANCE_THRESHOLD = 200.0  # Increased from 100 for testing
+            # Use a proper threshold for face_recognition
+            MAX_DISTANCE_THRESHOLD = 0.8  # Standard threshold for face_recognition
             
-            # If we already did per-face matching, use those results
+            # Use individual match results
             if found_ids:
-                # Filter by distance threshold and get only unique IDs
                 valid_matches = [student_id for student_id, distance in found_ids if distance <= MAX_DISTANCE_THRESHOLD]
                 unique_ids = list(set(valid_matches))
                 
-                # Count matches for each student_id for confidence rating
+                # Count matches per student
                 id_counts = {}
                 for student_id, distance in found_ids:
                     if distance <= MAX_DISTANCE_THRESHOLD:
                         id_counts[student_id] = id_counts.get(student_id, 0) + 1
-                
-                logger.info(f"Match counts per student: {id_counts}")
-                logger.info(f"Found {len(unique_ids)} unique students after distance filtering")
+                        
+                logger.info(f"Matches per student: {id_counts}")
+                logger.info(f"Found {len(unique_ids)} unique students after filtering")
             else:
-                # Do a regular batch search if individual matching wasn't done
+                # Batch search
                 emb_arr = np.vstack(all_features).astype('float32')
-                logger.info(f"Searching FAISS index with {faiss_index.ntotal} total vectors")
+                logger.info(f"Searching FAISS index with {faiss_index.ntotal} vectors")
                 
-                # Get distances for confidence filtering
                 distances, I = faiss_index.search(emb_arr, k=1)
                 
-                # Filter by distance and create unique set
                 valid_indices = []
                 for i, (dist, idx) in enumerate(zip(distances, I)):
                     face_id = idx[0]
@@ -545,62 +487,51 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
                     
                     if distance <= MAX_DISTANCE_THRESHOLD and face_id != -1 and face_id in students_map:
                         valid_indices.append(face_id)
-                        logger.info(f"Face {i+1} matched student_id {students_map[face_id]} with distance {distance} - VALID")
+                        logger.info(f"Face {i+1} matched {students_map[face_id]} with distance {distance} - VALID")
                     else:
                         if face_id != -1 and face_id in students_map:
-                            logger.info(f"Face {i+1} matched student_id {students_map[face_id]} with distance {distance} - REJECTED (too distant)")
+                            logger.info(f"Face {i+1} matched {students_map[face_id]} with distance {distance} - REJECTED")
                         else:
-                            logger.info(f"Face {i+1} had no valid match, distance: {distance}")
-                
-                # Get unique student IDs from valid faces only
+                            logger.info(f"Face {i+1} had no valid match")
+                            
                 unique_ids = list({students_map[i] for i in valid_indices})
-                logger.info(f"Found {len(unique_ids)} unique students after distance filtering")
-            
-            # Final check if we have any valid students
+                
+            # Final check
             if not unique_ids:
                 return JSONResponse(
                     content={
                         "message": "No students matched with sufficient confidence",
                         "debug_info": {
-                            "faiss_ntotal": faiss_index.ntotal,
-                            "students_map_size": len(students_map),
                             "faces_detected": len(face_positions),
-                            "features_extracted": len(all_features),
+                            "faces_processed": len(all_features),
                             "distance_threshold": MAX_DISTANCE_THRESHOLD
                         }
-                    }, 
+                    },
                     status_code=404
                 )
                 
         except Exception as e:
             logger.error(f"FAISS search error: {str(e)}")
-            return JSONResponse(
-                content={
-                    "message": "Error matching faces to database", 
-                    "error": str(e)
-                }, 
-                status_code=500
-            )
-
-        # Get student details with timeout handling
+            return JSONResponse(content={"message": f"Error matching faces: {str(e)}"}, status_code=500)
+            
+        # Get student details
         try:
             detected_students = []
             if unique_ids:
-                # Use a more efficient select that doesn't fetch embeddings
                 response = supabase.table("students").select('student_id,name,class_id').in_("student_id", unique_ids).execute()
                 detected_students = response.data
                 
             return JSONResponse(
                 content={
                     "detected_students": detected_students,
-                    "confidence_message": "Only showing matches with high confidence. Adjust threshold if needed.",
+                    "confidence_message": "Using precise face recognition model with strict matching",
                     "detection_info": {
                         "faces_detected": len(face_positions),
                         "faces_processed": len(all_features),
                         "matches_found": len(unique_ids),
-                        "faiss_index_size": faiss_index.ntotal
+                        "matching_threshold": MAX_DISTANCE_THRESHOLD
                     }
-                }, 
+                },
                 status_code=200
             )
             
@@ -609,7 +540,6 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
             return JSONResponse(content={"message": "Error retrieving student details"}, status_code=500)
             
     except Exception as e:
-        # Catch-all exception handler
         logger.error(f"Unexpected error in mark_attendance: {str(e)}")
         return JSONResponse(content={"message": "Server error processing attendance"}, status_code=500)
 
