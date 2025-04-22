@@ -276,6 +276,42 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
         # Process image with timeout control
         logger.info("Starting attendance marking process")
         
+        # Check and reload FAISS index before processing
+        try:
+            # Check current state of FAISS index
+            logger.info(f"FAISS index status before reload: total vectors: {faiss_index.ntotal}")
+            logger.info(f"Students map size before reload: {len(students_map)}")
+            
+            # Force reload the index regardless
+            logger.info("Forcing reload of FAISS index")
+            load_index()
+            
+            # Check again after reload
+            logger.info(f"FAISS index status after reload: total vectors: {faiss_index.ntotal}")
+            logger.info(f"Students map size after reload: {len(students_map)}")
+            
+            # Quick check for actual student data in Supabase
+            try:
+                rows = supabase.table("students").select("student_id,embeddings").execute().data
+                students_with_embeddings = [row["student_id"] for row in rows if row.get("embeddings") and len(row.get("embeddings", [])) > 0]
+                logger.info(f"Found {len(students_with_embeddings)} students with embeddings in database")
+                logger.info(f"Students with embeddings: {students_with_embeddings}")
+                
+                if not students_with_embeddings:
+                    logger.error("No students with embeddings found in database")
+                    return JSONResponse(
+                        content={
+                            "message": "No student data with embeddings found in the database. Please register students with photos first.",
+                            "error_code": "NO_EMBEDDINGS_IN_DB"
+                        }, 
+                        status_code=404
+                    )
+            except Exception as e:
+                logger.error(f"Error checking student embeddings in database: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error during FAISS index reload: {str(e)}")
+            # Continue anyway, we'll check again later
+        
         # Get image data
         start_time = datetime.now()
         data = await teacher_image.read()
@@ -391,12 +427,16 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
                         # Debug identification for individual face
                         try:
                             face_emb = np.array([features[0]]).astype('float32')
+                            
+                            # Double-check FAISS index here
+                            if faiss_index.ntotal == 0:
+                                logger.error("FAISS index is still empty in face loop, skipping match")
+                                continue
+                                
                             face_distances, face_I = faiss_index.search(face_emb, k=3)  # Get top 3 matches for verification
                             
-                            # Only attempt match if reasonably close (distance threshold)
-                            # L2 distance threshold (lower means more strict matching)
-                            # This is a key factor in eliminating false matches
-                            max_distance = 100.0  # Adjust based on testing
+                            # Use a more relaxed distance threshold for testing
+                            max_distance = 200.0  # Increased from 100 for testing
                             
                             closest_distance = face_distances[0][0]
                             closest_id = face_I[0][0]
@@ -450,8 +490,30 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
             
         # Search in FAISS index with improved confidence thresholds
         try:
-            # Filter matches based on distance threshold
-            MAX_DISTANCE_THRESHOLD = 100.0  # Same threshold as above for consistency
+            # Final check on FAISS index before searching
+            if faiss_index.ntotal == 0:
+                # One last attempt to reload
+                logger.error("FAISS index still empty before final search, attempting one last reload")
+                load_index()
+                
+                if faiss_index.ntotal == 0:
+                    # If still empty, return detailed error
+                    logger.error("FAISS index remains empty after reload attempts")
+                    return JSONResponse(
+                        content={
+                            "message": "Student database exists but embeddings couldn't be loaded into search index",
+                            "debug_info": {
+                                "faiss_ntotal": 0,
+                                "students_map_size": len(students_map),
+                                "faces_detected": len(face_positions),
+                                "features_extracted": len(all_features)
+                            }
+                        }, 
+                        status_code=500
+                    )
+                    
+            # Use a more relaxed distance threshold for testing
+            MAX_DISTANCE_THRESHOLD = 200.0  # Increased from 100 for testing
             
             # If we already did per-face matching, use those results
             if found_ids:
@@ -470,14 +532,6 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
             else:
                 # Do a regular batch search if individual matching wasn't done
                 emb_arr = np.vstack(all_features).astype('float32')
-                
-                # Sanity check on FAISS index
-                if faiss_index.ntotal == 0:
-                    logger.error("FAISS index is empty, attempting to reload")
-                    load_index()
-                    if faiss_index.ntotal == 0:
-                        return JSONResponse(content={"message": "No student data available for comparison"}, status_code=404)
-                        
                 logger.info(f"Searching FAISS index with {faiss_index.ntotal} total vectors")
                 
                 # Get distances for confidence filtering
@@ -504,11 +558,29 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
             
             # Final check if we have any valid students
             if not unique_ids:
-                return JSONResponse(content={"message": "No students matched with sufficient confidence"}, status_code=404)
+                return JSONResponse(
+                    content={
+                        "message": "No students matched with sufficient confidence",
+                        "debug_info": {
+                            "faiss_ntotal": faiss_index.ntotal,
+                            "students_map_size": len(students_map),
+                            "faces_detected": len(face_positions),
+                            "features_extracted": len(all_features),
+                            "distance_threshold": MAX_DISTANCE_THRESHOLD
+                        }
+                    }, 
+                    status_code=404
+                )
                 
         except Exception as e:
             logger.error(f"FAISS search error: {str(e)}")
-            return JSONResponse(content={"message": "Error matching faces to database"}, status_code=500)
+            return JSONResponse(
+                content={
+                    "message": "Error matching faces to database", 
+                    "error": str(e)
+                }, 
+                status_code=500
+            )
 
         # Get student details with timeout handling
         try:
@@ -525,7 +597,8 @@ async def mark_attendance(teacher_image: UploadFile = File(...)):
                     "detection_info": {
                         "faces_detected": len(face_positions),
                         "faces_processed": len(all_features),
-                        "matches_found": len(unique_ids)
+                        "matches_found": len(unique_ids),
+                        "faiss_index_size": faiss_index.ntotal
                     }
                 }, 
                 status_code=200
