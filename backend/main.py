@@ -278,6 +278,18 @@ async def process_embeddings(student_id: str, image_paths: List[str]):
                         continue
                     
                     logger.info(f"Image decoded successfully, shape: {img_arr.shape}")
+                    
+                    # Resize large images to prevent memory issues
+                    max_size = 800  # Limit width/height to 800px
+                    h, w = img_arr.shape[:2]
+                    if h > max_size or w > max_size:
+                        scale = max_size / max(h, w)
+                        logger.info(f"Resizing large image from {w}x{h} to {int(w*scale)}x{int(h*scale)}")
+                        img_arr = cv2.resize(img_arr, (int(w * scale), int(h * scale)))
+                        logger.info(f"Image resized successfully to {img_arr.shape}")
+                        # Force garbage collection after resize
+                        gc.collect()
+                    
                 except Exception as e:
                     logger.error(f"Error decoding image: {str(e)}")
                     logger.error(traceback.format_exc())
@@ -661,6 +673,7 @@ async def save_attendance(student_ids: List[str] = Body(...)):
     )
 
 @app.get("/check-embeddings/{student_id}")
+@app.post("/check-embeddings/{student_id}")
 async def check_embeddings(student_id: str):
     try:
         # Get student data
@@ -699,6 +712,12 @@ async def check_embeddings(student_id: str):
     except Exception as e:
         logger.error(f"Error checking embeddings: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error checking embeddings: {str(e)}")
+
+@app.get("//check-embeddings/{student_id}")
+@app.post("//check-embeddings/{student_id}")
+async def check_embeddings_alt(student_id: str):
+    """Alternative URLs for check-embeddings with double slashes"""
+    return await check_embeddings(student_id)
 
 @app.post("/reprocess-all-embeddings")
 async def reprocess_all_embeddings(background_tasks: BackgroundTasks = BackgroundTasks()):
@@ -918,6 +937,132 @@ async def test_supabase():
         result["overall"] = "partial"
     
     return result
+
+@app.post("/process-low-res/{student_id}")
+async def process_low_res(student_id: str, background_tasks: BackgroundTasks = BackgroundTasks()):
+    """
+    Process embeddings for a student with lower resolution to reduce memory usage.
+    """
+    try:
+        # Get student data
+        logger.info(f"Starting low-res processing for student {student_id}")
+        response = supabase.table("students").select("*").eq("student_id", student_id).execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=404, detail=f"Student with ID {student_id} not found")
+            
+        student = response.data[0]
+        folder_path = student.get("image_folder_path")
+        
+        if not folder_path:
+            raise HTTPException(status_code=404, detail=f"No image folder found for student {student_id}")
+            
+        # Get image files from the folder
+        try:
+            # List files in the folder
+            bucket_name = "studentfaces"
+            list_response = supabase.storage.from_(bucket_name).list(folder_path)
+            
+            if not list_response:
+                raise HTTPException(status_code=404, detail=f"No images found for student {student_id}")
+                
+            # Get full paths
+            image_paths = [f"{folder_path}/{file}" for file in list_response]
+            logger.info(f"Found {len(image_paths)} images for student {student_id}")
+            
+            # Process one image at a time to reduce memory usage
+            vectors = []
+            
+            for i, path in enumerate(image_paths, 1):
+                try:
+                    logger.info(f"Processing image {i}/{len(image_paths)}: {path}")
+                    
+                    # Get image from Supabase storage
+                    response = supabase.storage.from_(bucket_name).download(path)
+                    
+                    if not response or len(response) == 0:
+                        logger.error(f"Empty response from Supabase for image {path}")
+                        continue
+                    
+                    # Convert to image array
+                    nparr = np.frombuffer(response, dtype=np.uint8)
+                    img_arr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    del response, nparr
+                    gc.collect()
+                    
+                    if img_arr is None:
+                        logger.error("Failed to decode image to numpy array")
+                        continue
+                    
+                    # Force resize to low resolution
+                    max_size = 500  # Very low resolution to minimize memory usage
+                    h, w = img_arr.shape[:2]
+                    scale = max_size / max(h, w)
+                    img_arr = cv2.resize(img_arr, (int(w * scale), int(h * scale)))
+                    logger.info(f"Resized image to {img_arr.shape}")
+                    gc.collect()
+                    
+                    # Extract features using face_recognition
+                    features = extract_face_features(img_arr)
+                    if features and len(features) > 0:
+                        feature_vec = features[0]
+                        vectors.append(feature_vec)
+                        logger.info(f"Successfully extracted features from image {i}")
+                    else:
+                        logger.warning(f"No face found in image {i}")
+                    
+                    # Clear memory
+                    del img_arr, features
+                    gc.collect()
+                    
+                except Exception as e:
+                    logger.error(f"Error processing image {i}: {str(e)}")
+                    continue
+            
+            # Update database with embeddings
+            if vectors:
+                # Convert embeddings for storage
+                embeddings_list = []
+                for embedding in vectors:
+                    emb_list = [float(val) for val in embedding.tolist()]
+                    embeddings_list.append(emb_list)
+                
+                # Update database
+                response = supabase.table("students").update({
+                    "embeddings": embeddings_list
+                }).eq("student_id", student_id).execute()
+                
+                if hasattr(response, 'error') and response.error:
+                    raise HTTPException(status_code=500, detail=f"Database update error: {response.error}")
+                
+                # Update FAISS index
+                try:
+                    load_index()
+                except Exception as e:
+                    logger.error(f"Error updating FAISS index: {str(e)}")
+                
+                return JSONResponse(
+                    content={
+                        "message": f"Successfully processed {len(vectors)} embeddings with low resolution",
+                        "student_id": student_id,
+                        "embeddings_generated": len(vectors)
+                    },
+                    status_code=200
+                )
+            else:
+                raise HTTPException(status_code=400, detail="No valid face embeddings could be generated")
+                
+        except HTTPException as he:
+            raise he
+        except Exception as e:
+            logger.error(f"Error processing images: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error processing images: {str(e)}")
+            
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error in low-res processing: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error in low-res processing: {str(e)}")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
