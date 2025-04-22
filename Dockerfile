@@ -1,14 +1,18 @@
 # Use Python slim image for smaller size
 FROM python:3.10-slim
 
-# Install system dependencies for OpenCV and other libraries
+# Install system dependencies for OpenCV, dlib and other libraries
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    cmake \
     libgl1-mesa-glx \
     libglib2.0-0 \
     libsm6 \
     libxrender1 \
     libxext6 \
+    libx11-6 \
+    libopenblas-dev \
+    liblapack-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -18,8 +22,12 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install Python dependencies in stages for better caching
+# Install dlib separately first with optimizations
 RUN pip install --upgrade pip && \
+    pip install --no-cache-dir numpy && \
+    pip install --no-cache-dir dlib && \
     pip install --no-cache-dir -r requirements.txt
+
 # Copy application code
 COPY backend/ ./backend
 COPY backend/utils/ ./backend/utils
